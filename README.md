@@ -1,13 +1,16 @@
-# Luna Code — AI Coding Agent for VS Code
+<p align="center">
+  <img src="media/icon.png" alt="Luna Code" width="140" />
+</p>
 
-Luna Code is a Claude Code-style **agentic coding assistant** that runs entirely on
+<h1 align="center">Luna Code</h3>
+<h3 align="center">AI Coding Agent for VS Code</h5>
+
+Luna Code is an **agentic coding assistant** that runs entirely on
 [OpenRouter](https://openrouter.ai). Point it at any model OpenRouter supports
 with **just an API key and a model id** — no other configuration required.
 
 It's built for fast codebase navigation, efficient agentic sessions, and
 **prompt-cache hit optimization** so long sessions stay cheap and fast.
-
-![Luna Code](media/icon.png)
 
 ## Features
 
