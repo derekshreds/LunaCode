@@ -1,0 +1,277 @@
+{
+  "name": "lunacode",
+  "displayName": "Luna Code — AI Coding Agent",
+  "description": "An agentic coding assistant powered by OpenRouter. Configure with just an API key and a model.",
+  "version": "0.1.0",
+  "publisher": "derekshreds",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/derekshreds/lunacode.git"
+  },
+  "homepage": "https://github.com/derekshreds/lunacode#readme",
+  "bugs": {
+    "url": "https://github.com/derekshreds/lunacode/issues"
+  },
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "openrouter",
+    "ai",
+    "agent",
+    "copilot",
+    "chat",
+    "llm",
+    "coding assistant"
+  ],
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#111115",
+    "theme": "dark"
+  },
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "lunacode-sidebar",
+          "title": "Luna Code",
+          "icon": "media/sidebar-icon.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "lunacode-secondary",
+          "title": "Luna Code",
+          "icon": "media/sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "lunacode-sidebar": [
+        {
+          "type": "webview",
+          "id": "lunacode.chatView",
+          "name": "Luna Code",
+          "icon": "media/sidebar-icon.svg",
+          "contextualTitle": "Luna Code"
+        }
+      ],
+      "lunacode-secondary": [
+        {
+          "type": "webview",
+          "id": "lunacode.chatViewAux",
+          "name": "Luna Code",
+          "icon": "media/sidebar-icon.svg",
+          "contextualTitle": "Luna Code"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "lunacode.openChat",
+        "title": "Luna Code: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "lunacode.newSession",
+        "title": "Luna Code: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "lunacode.openInEditor",
+        "title": "Luna Code: Open in Editor Tab",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "lunacode.openInSecondarySideBar",
+        "title": "Luna Code: Open in Secondary Side Bar",
+        "icon": "$(layout-sidebar-right)"
+      },
+      {
+        "command": "lunacode.setApiKey",
+        "title": "Luna Code: Set OpenRouter API Key"
+      },
+      {
+        "command": "lunacode.clearApiKey",
+        "title": "Luna Code: Clear OpenRouter API Key"
+      },
+      {
+        "command": "lunacode.selectModel",
+        "title": "Luna Code: Select Model"
+      },
+      {
+        "command": "lunacode.addSelectionToChat",
+        "title": "Luna Code: Add Selection to Chat"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "lunacode.openInSecondarySideBar",
+          "when": "view == lunacode.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "lunacode.openInEditor",
+          "when": "view == lunacode.chatView || view == lunacode.chatViewAux",
+          "group": "navigation@2"
+        },
+        {
+          "command": "lunacode.newSession",
+          "when": "view == lunacode.chatView || view == lunacode.chatViewAux",
+          "group": "navigation@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "lunacode.addSelectionToChat",
+          "when": "editorHasSelection",
+          "group": "lunacode@1"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "lunacode.openChat",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l"
+      },
+      {
+        "command": "lunacode.addSelectionToChat",
+        "key": "ctrl+shift+k",
+        "mac": "cmd+shift+k",
+        "when": "editorHasSelection"
+      }
+    ],
+    "configuration": {
+      "title": "Luna Code",
+      "properties": {
+        "lunacode.model": {
+          "type": "string",
+          "default": "deepseek/deepseek-v4-flash",
+          "description": "OpenRouter model id used for agentic coding sessions. Use the model picker (or browse the live list at https://openrouter.ai/models) for current ids."
+        },
+        "lunacode.baseUrl": {
+          "type": "string",
+          "default": "https://openrouter.ai/api/v1",
+          "description": "OpenRouter API base URL. Override only if you use a proxy."
+        },
+        "lunacode.defaultMode": {
+          "type": "string",
+          "enum": [
+            "standard",
+            "auto",
+            "plan"
+          ],
+          "enumDescriptions": [
+            "Standard — approve each command/edit before it runs.",
+            "Auto — run edits and commands autonomously without prompting (always-deny commands are still blocked).",
+            "Plan — read-only research and planning; never edits files or runs mutating commands."
+          ],
+          "default": "standard",
+          "description": "Default agent mode for new sessions."
+        },
+        "lunacode.maxTokens": {
+          "type": "number",
+          "default": 0,
+          "description": "Maximum tokens to generate per assistant turn. 0 (recommended) lets the provider use the model's full output limit, so write_file can emit large files without truncating. Set a positive number only to cap cost — but too low truncates tool calls and causes 'invalid JSON arguments' errors."
+        },
+        "lunacode.temperature": {
+          "type": "number",
+          "default": 0,
+          "description": "Sampling temperature. 0 is best for deterministic agentic coding."
+        },
+        "lunacode.enablePromptCaching": {
+          "type": "boolean",
+          "default": true,
+          "description": "Insert cache_control breakpoints on stable prefixes (system prompt, tools, prior turns) to maximize provider prompt-cache hits."
+        },
+        "lunacode.dataCollection": {
+          "type": "string",
+          "enum": ["deny", "allow"],
+          "enumDescriptions": [
+            "Deny — only route to OpenRouter providers that do NOT store or train on your prompts (recommended for code).",
+            "Allow — permit all providers, including ones that may retain or train on data."
+          ],
+          "default": "deny",
+          "description": "Restrict OpenRouter routing to providers that do not use your data for training."
+        },
+        "lunacode.zeroDataRetention": {
+          "type": "boolean",
+          "default": false,
+          "description": "Stricter than dataCollection: only route to Zero-Data-Retention (ZDR) endpoints. May reduce the set of available providers and occasionally cause routing failures if no ZDR endpoint exists for the model."
+        },
+        "lunacode.maxContextTokens": {
+          "type": "number",
+          "default": 180000,
+          "description": "Approximate token budget for the conversation before older turns are summarized/compacted."
+        },
+        "lunacode.autoApproveCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "ls",
+            "cat",
+            "pwd",
+            "echo",
+            "grep",
+            "rg",
+            "find",
+            "git status",
+            "git diff",
+            "git log",
+            "node --version",
+            "npm --version",
+            "tsc --noEmit"
+          ],
+          "description": "Command prefixes auto-approved even in Standard mode."
+        },
+        "lunacode.alwaysDenyCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "rm -rf /",
+            "rm -rf ~",
+            ":(){:|:&};:",
+            "mkfs",
+            "dd if="
+          ],
+          "description": "Command substrings that are always blocked regardless of mode."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "node esbuild.js --production",
+    "check-types": "tsc --noEmit",
+    "lint": "echo \"(no lint configured)\"",
+    "pretest": "node scripts/build-tests.js",
+    "test": "node dist/test-context.js && node dist/test-usage.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "highlight.js": "^11.11.1",
+    "marked": "^12.0.2"
+  }
+}
