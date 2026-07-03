@@ -152,6 +152,7 @@ export class LunaCodeController {
       msg.type === "settingsData" ||
       msg.type === "usageReport" ||
       msg.type === "streamProgress" ||
+      msg.type === "toolOutput" || // live-only; a flood would evict the transcript
       msg.type === "fileMatches"
     ) {
       return;
@@ -484,25 +485,91 @@ export class LunaCodeController {
     void this.maybePrewarm();
   }
 
+  /** Index into workspaceFolders for multi-root workspaces. */
+  private activeRootIndex = 0;
+
   private workspaceRoot(): string | undefined {
-    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.length) return undefined;
+    return (folders[this.activeRootIndex] ?? folders[0]).uri.fsPath;
   }
 
-  /** Project memory: LUNA.md at the workspace root, capped so a giant memory
-   * file can't blow up the (cached) system prompt. Re-read each turn — if the
-   * agent updates it mid-session, the next turn pays one cache re-write and
-   * then the new prefix is stable again. */
-  private readProjectMemory(root: string): string | undefined {
-    try {
-      const p = `${root}/LUNA.md`;
-      if (!fs.existsSync(p)) return undefined;
-      const text = fs.readFileSync(p, "utf8").trim();
-      if (!text) return undefined;
-      const MAX = 6000;
-      return text.length > MAX ? text.slice(0, MAX) + "\n…[LUNA.md truncated]" : text;
-    } catch {
-      return undefined;
+  /** Multi-root workspaces: pick which folder the agent works in. */
+  async pickWorkspaceFolder() {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length < 2) {
+      void vscode.window.showInformationMessage("Luna Code: this workspace has a single folder.");
+      return;
     }
+    const picked = await vscode.window.showQuickPick(
+      folders.map((f, i) => ({
+        label: f.name,
+        description: f.uri.fsPath,
+        index: i,
+        picked: i === this.activeRootIndex,
+      })),
+      { title: "Luna Code: which folder should the agent work in?" }
+    );
+    if (!picked) return;
+    this.activeRootIndex = picked.index;
+    this.fileListCache = null; // @-mention list is per-root
+    this.post({ type: "status", message: `Working folder: ${picked.label}` });
+  }
+
+  /** Project memory: LUNA.md at the workspace root plus nested LUNA.md files
+   * in subdirectories (monorepo packages), capped so memory can't blow up the
+   * (cached) system prompt. Re-read each turn — if the agent updates one
+   * mid-session, the next turn pays one cache re-write and then the new
+   * prefix is stable again. */
+  private readProjectMemory(root: string): string | undefined {
+    const sections: string[] = [];
+    try {
+      const rootFile = path.join(root, "LUNA.md");
+      if (fs.existsSync(rootFile)) {
+        const text = fs.readFileSync(rootFile, "utf8").trim();
+        if (text) {
+          const MAX = 6000;
+          sections.push(text.length > MAX ? text.slice(0, MAX) + "\n…[LUNA.md truncated]" : text);
+        }
+      }
+      // Nested memory files (depth-limited walk, ignored dirs skipped).
+      const nested: string[] = [];
+      const walk = (dir: string, depth: number) => {
+        if (depth > 4 || nested.length >= 4) return;
+        let entries: fs.Dirent[];
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const e of entries) {
+          if (nested.length >= 4) return;
+          const abs = path.join(dir, e.name);
+          if (e.isDirectory()) {
+            if (!IGNORED_DIRS.has(e.name) && !e.name.startsWith(".")) walk(abs, depth + 1);
+          } else if (e.name === "LUNA.md" && abs !== path.join(root, "LUNA.md")) {
+            nested.push(abs);
+          }
+        }
+      };
+      walk(root, 0);
+      for (const abs of nested) {
+        try {
+          const text = fs.readFileSync(abs, "utf8").trim();
+          if (!text) continue;
+          const rel = abs.slice(root.length + 1);
+          const MAX = 1500;
+          sections.push(
+            `### ${rel}\n` + (text.length > MAX ? text.slice(0, MAX) + "\n…[truncated]" : text)
+          );
+        } catch {
+          /* skip unreadable */
+        }
+      }
+    } catch {
+      /* memory is best-effort */
+    }
+    return sections.length ? sections.join("\n\n") : undefined;
   }
 
   private workspaceOverview(root: string): string {
@@ -889,8 +956,8 @@ export class LunaCodeController {
       this.post({ type: "status", message: "Wait for the current turn to finish (or stop it) first." });
       return;
     }
-    const text = this.context.rollbackToLastUser();
-    if (text === null) {
+    const rolled = this.context.rollbackToLastUser();
+    if (rolled === null) {
       this.post({ type: "status", message: "Nothing to retry." });
       return;
     }
@@ -902,9 +969,14 @@ export class LunaCodeController {
     if (lastEcho) this.transcript.splice(lastEcho.i);
     this.post({ type: "rollback" });
     if (edit) {
-      this.post({ type: "composerFill", text });
+      this.post({ type: "composerFill", text: rolled.text });
     } else {
-      await this.onSend(text);
+      // Re-queue DIRECTLY: the rolled-back text already carries slash
+      // expansion, selections, and the editor note — onSend would add them
+      // twice. Images ride along too.
+      this.post({ type: "userEcho", text: rolled.text, queued: false });
+      this.queue.push({ text: rolled.text, images: rolled.images.length ? rolled.images : undefined });
+      void this.pump();
     }
   }
 
@@ -951,6 +1023,18 @@ export class LunaCodeController {
       const branch = `luna/sandbox-${ts}`;
       const dir = path.join(os.tmpdir(), `lunacode-sandbox-${ts}`);
       await execGit(realRoot, ["worktree", "add", "-b", branch, dir]);
+      // Best-effort: link dependency dirs so builds/tests work in the sandbox.
+      for (const dep of ["node_modules", ".venv", "vendor"]) {
+        const src = path.join(realRoot, dep);
+        const dest = path.join(dir, dep);
+        try {
+          if (fs.existsSync(src) && !fs.existsSync(dest)) {
+            fs.symlinkSync(src, dest, os.platform() === "win32" ? "junction" : "dir");
+          }
+        } catch {
+          /* linking is a convenience only */
+        }
+      }
       this.sandbox = { dir, branch };
       this.post({
         type: "status",
@@ -1168,6 +1252,7 @@ export class LunaCodeController {
           subject: req.subject,
           detail: req.detail,
           diff: req.diff,
+          diffs: req.diffs,
         },
       });
     });
@@ -1240,6 +1325,9 @@ export class LunaCodeController {
         break;
       case "stream_progress":
         this.post({ type: "streamProgress", tokens: e.tokens });
+        break;
+      case "tool_output":
+        this.post({ type: "toolOutput", id: e.id, delta: e.delta });
         break;
       case "compaction":
         this.sessionUsage = {

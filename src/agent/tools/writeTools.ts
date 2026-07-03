@@ -164,6 +164,7 @@ export const applyPatchTool: Tool = {
       subject: `${valid.length} file(s)`,
       detail: diffs.map((d) => `${d.path}  (+${d.addCount} −${d.delCount})`).join("\n"),
       diff: biggest,
+      diffs,
     });
     if (decision === "rejected") {
       return { content: "User rejected the patch.", isError: true };

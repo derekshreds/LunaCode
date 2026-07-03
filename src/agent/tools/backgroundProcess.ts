@@ -96,10 +96,12 @@ export const startProcessTool: Tool = {
       exited: null,
     };
     const append = (chunk: Buffer) => {
-      entry.buffer += chunk.toString("utf8");
+      const s = chunk.toString("utf8");
+      entry.buffer += s;
       if (entry.buffer.length > MAX_BUFFER_CHARS) {
         entry.buffer = entry.buffer.slice(entry.buffer.length - MAX_BUFFER_CHARS);
       }
+      ctx.emitOutput?.(s); // live startup output in the tool card
     };
     proc.stdout?.on("data", append);
     proc.stderr?.on("data", append);

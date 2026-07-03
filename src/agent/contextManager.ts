@@ -364,25 +364,27 @@ export class ContextManager {
   }
 
   /**
-   * Remove the last user message and everything after it, returning its text.
-   * Used by retry / edit-and-resend. Returns null when there is no user
-   * message (nothing to roll back).
+   * Remove the last user message and everything after it, returning its text
+   * and any attached images. Used by retry / edit-and-resend. Returns null
+   * when there is no user message (nothing to roll back).
    */
-  rollbackToLastUser(): string | null {
+  rollbackToLastUser(): { text: string; images: string[] } | null {
     const idx = this.lastUserIndex();
     if (idx < 0) return null;
     const m = this.messages[idx];
-    const text =
-      typeof m.content === "string"
-        ? m.content
-        : Array.isArray(m.content)
-          ? m.content
-              .map((p: any) => (p?.type === "text" ? p.text : ""))
-              .join(" ")
-              .trim()
-          : "";
+    let text = "";
+    const images: string[] = [];
+    if (typeof m.content === "string") {
+      text = m.content;
+    } else if (Array.isArray(m.content)) {
+      for (const p of m.content as any[]) {
+        if (p?.type === "text") text += (text ? " " : "") + p.text;
+        else if (p?.type === "image_url" && p.image_url?.url) images.push(p.image_url.url);
+      }
+      text = text.trim();
+    }
     this.messages.splice(idx);
-    return text;
+    return { text, images };
   }
 
   private lastTextBearingIndex(): number {

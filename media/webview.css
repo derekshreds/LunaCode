@@ -1709,3 +1709,51 @@ pre.code-full {
 .code-body pre[data-lang]::before {
   display: none;
 }
+
+/* ---------- Live tool output (non-scrollable tail, click to expand) ---------- */
+.tool-output {
+  margin: 4px 0 2px 18px;
+  padding: 6px 9px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  cursor: pointer;
+}
+.tool-output:hover {
+  border-color: var(--accent);
+}
+.tool-output[data-more="1"]::before {
+  content: "···";
+  display: block;
+  color: var(--text-faint);
+}
+.output-full {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+}
+
+/* Approval: multi-file previews + capped detail */
+.approval-diffs {
+  max-height: 40vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.approval-detail {
+  max-height: 140px;
+  overflow: hidden;
+  cursor: pointer;
+}
+.approval-detail:hover {
+  border-color: var(--accent);
+}

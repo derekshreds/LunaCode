@@ -135,6 +135,10 @@
       {
         "command": "lunacode.exportSession",
         "title": "Luna Code: Export Session as Markdown"
+      },
+      {
+        "command": "lunacode.selectWorkspaceFolder",
+        "title": "Luna Code: Select Working Folder (Multi-root)"
       }
     ],
     "menus": {

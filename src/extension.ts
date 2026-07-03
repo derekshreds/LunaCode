@@ -156,7 +156,45 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand("lunacode.mergeSandbox", () => controller.mergeSandbox()),
     vscode.commands.registerCommand("lunacode.discardSandbox", () => controller.discardSandbox()),
-    vscode.commands.registerCommand("lunacode.exportSession", () => controller.exportSession())
+    vscode.commands.registerCommand("lunacode.exportSession", () => controller.exportSession()),
+    vscode.commands.registerCommand("lunacode.selectWorkspaceFolder", () =>
+      controller.pickWorkspaceFolder()
+    ),
+
+    // Quick-fix lightbulb: "Fix with Luna Code" on any diagnostic.
+    vscode.languages.registerCodeActionsProvider(
+      { scheme: "file" },
+      {
+        provideCodeActions(document, range, ctx) {
+          const relevant = ctx.diagnostics.filter(
+            (d) => d.severity <= vscode.DiagnosticSeverity.Warning
+          );
+          if (!relevant.length) return [];
+          const action = new vscode.CodeAction(
+            "Fix with Luna Code",
+            vscode.CodeActionKind.QuickFix
+          );
+          action.command = {
+            command: "lunacode.fixDiagnosticAt",
+            title: "Fix with Luna Code",
+            arguments: [document.uri, relevant.map((d) => ({
+              line: d.range.start.line + 1,
+              message: d.message,
+            }))],
+          };
+          return [action];
+        },
+      },
+      { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }
+    ),
+    vscode.commands.registerCommand(
+      "lunacode.fixDiagnosticAt",
+      async (uri: vscode.Uri, diags: Array<{ line: number; message: string }>) => {
+        const rel = vscode.workspace.asRelativePath(uri);
+        const list = diags.map((d) => `${rel}:${d.line} ${d.message}`).join("\n");
+        await controller.sendExternal(`Fix this problem:\n${list}`);
+      }
+    )
   );
 
   context.subscriptions.push(

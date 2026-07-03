@@ -51,6 +51,8 @@ export type AgentEvent =
   /** Live generation progress (throttled) — includes tool-call argument
    * streaming, which otherwise produces no visible output. */
   | { type: "stream_progress"; tokens: number }
+  /** Live tool output (stdout, explore lookups) for a running tool card. */
+  | { type: "tool_output"; id: string; delta: string }
   | { type: "error"; message: string }
   | { type: "turn_end"; stopReason: string };
 
@@ -460,6 +462,8 @@ export class Agent {
       signal,
       output: this.deps.output,
       log: (m) => this.cb.onEvent({ type: "status", message: m }),
+      emitOutput: (delta) =>
+        this.cb.onEvent({ type: "tool_output", id: call.id, delta }),
       requestApproval: async (req) => {
         // Auto mode is fully autonomous: it runs edits AND commands without
         // prompting. (Always-deny commands are still hard-blocked inside
@@ -479,7 +483,9 @@ export class Agent {
           workspaceRoot: this.deps.workspaceRoot,
           output: this.deps.output,
           signal,
-          onStatus: (m) => this.cb.onEvent({ type: "status", message: m }),
+          // Sub-agent progress streams into the explore call's own card.
+          onStatus: (m) =>
+            this.cb.onEvent({ type: "tool_output", id: call.id, delta: m + "\n" }),
           onUsage: (usage) =>
             this.cb.onEvent({
               type: "usage",

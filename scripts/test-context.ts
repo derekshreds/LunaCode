@@ -131,8 +131,8 @@ async function compactionTests() {
 
     cm.addUser("question two");
     cm.addAssistant({ role: "assistant", content: "answer two" });
-    const text = cm.rollbackToLastUser();
-    assert(text === "question two", "rollback returns the last user text");
+    const rolled = cm.rollbackToLastUser();
+    assert(rolled?.text === "question two", "rollback returns the last user text");
     const msgs = cm.getMessages();
     const last = msgs[msgs.length - 1];
     assert(

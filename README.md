@@ -81,7 +81,9 @@ It's built for fast codebase navigation, efficient agentic sessions, and
   (even in Auto mode) and asks before spending past your limit.
 - **Editor-aware.** Each message can carry your active file + selection
   (`lunacode.includeActiveFile`); right-click menu adds *Fix Problems in This
-  File*, *Refactor Selection…*, and *Explain Selection*.
+  File*, *Refactor Selection…*, and *Explain Selection*; and every diagnostic's
+  lightbulb offers **Fix with Luna Code**. Multi-root workspaces pick their
+  working folder via *Select Working Folder*.
 - **Slash commands.** `/commit`, `/review`, `/tests` built in, plus your own
   templates via `lunacode.customCommands` — with autocomplete in the composer.
 - **Image paste.** Paste screenshots into the composer (up to 3, multimodal
@@ -94,6 +96,12 @@ It's built for fast codebase navigation, efficient agentic sessions, and
   blocks are height-capped with click-to-expand; a live `~N tok` counter shows
   progress during long silent generations; and an actions menu (⋯) gathers
   review/revert/retry/edit/export with plain-text labels.
+- **Live tool output.** Commands stream their stdout into the tool card as
+  they run (last few lines, click for the full log), background processes show
+  their startup output, and the explore sub-agent's lookups stream into its
+  card so its research is visible.
+- **Monorepo memory.** Nested `LUNA.md` files in subdirectories load alongside
+  the root one, each labeled with its path.
 - **Cache-hit optimized.** A stable system-prompt prefix plus rolling
   `cache_control` breakpoints maximize provider prompt caching (Anthropic /
   Gemini via OpenRouter; automatic for OpenAI). The composer shows a live

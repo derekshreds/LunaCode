@@ -29,6 +29,8 @@ export interface ApprovalPayload {
   subject: string;
   detail?: string;
   diff?: DiffData;
+  /** Multi-file patches: one diff per file (diff holds the largest). */
+  diffs?: DiffData[];
 }
 
 export interface UsagePayload {
@@ -183,7 +185,9 @@ export type HostToWebview =
   /** Put text into the composer (edit-and-resend flow). */
   | { type: "composerFill"; text: string }
   /** Throttled live token counter while the model generates. */
-  | { type: "streamProgress"; tokens: number };
+  | { type: "streamProgress"; tokens: number }
+  /** Live output (stdout, explore lookups) for a running tool card. */
+  | { type: "toolOutput"; id: string; delta: string };
 
 // Webview -> Extension
 export type WebviewToHost =

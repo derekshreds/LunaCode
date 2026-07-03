@@ -455,13 +455,25 @@ const VERBS: Record<string, [string, string]> = {
   list_dir: ["Listing", "Listed"],
   glob: ["Finding files", "Found files"],
   grep: ["Searching", "Searched"],
+  file_outline: ["Outlining", "Outlined"],
   get_diagnostics: ["Checking diagnostics", "Checked diagnostics"],
+  explore: ["Exploring", "Explored"],
+  set_tasks: ["Planning", "Updated plan"],
   write_file: ["Writing", "Wrote"],
   edit_file: ["Editing", "Edited"],
+  apply_patch: ["Patching", "Patched"],
   run_command: ["Running", "Ran"],
+  start_process: ["Starting", "Started"],
+  read_process: ["Reading output", "Read output"],
+  stop_process: ["Stopping", "Stopped"],
 };
 
 function friendly(name: string, args: any): { verbs: [string, string]; target: string } {
+  // MCP tools arrive as mcp__server__tool.
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(name);
+  if (mcp) {
+    return { verbs: ["Calling MCP", "Called MCP"], target: `${mcp[1]} · ${mcp[2]}` };
+  }
   const verbs = VERBS[name] ?? [name, name];
   let target = "";
   try {
@@ -481,7 +493,11 @@ function friendly(name: string, args: any): { verbs: [string, string]; target: s
         break;
       case "write_file":
       case "edit_file":
+      case "file_outline":
         target = args.path ?? "";
+        break;
+      case "apply_patch":
+        target = Array.isArray(args.changes) ? `${args.changes.length} file(s)` : "";
         break;
       case "glob":
         target = args.pattern ?? "";
@@ -492,8 +508,19 @@ function friendly(name: string, args: any): { verbs: [string, string]; target: s
       case "get_diagnostics":
         target = args.path ?? "workspace";
         break;
+      case "explore":
+        target = typeof args.question === "string" ? args.question.slice(0, 80) : "";
+        break;
+      case "set_tasks":
+        target = Array.isArray(args.tasks) ? `${args.tasks.length} step(s)` : "";
+        break;
       case "run_command":
+      case "start_process":
         target = args.command ?? "";
+        break;
+      case "read_process":
+      case "stop_process":
+        target = args.id ?? "";
         break;
     }
   } catch {
@@ -642,6 +669,44 @@ function codeCell(text: string | undefined, type: string | undefined, lang?: str
   return cell;
 }
 
+// ---------- Live tool output (stdout / explore progress) ----------
+// Full text lives here; the card shows a non-scrollable tail. Click → sheet.
+const toolOutputs = new Map<string, string>();
+const OUTPUT_PREVIEW_LINES = 8;
+const OUTPUT_KEEP_CHARS = 200_000;
+
+function appendToolOutput(id: string, delta: string) {
+  const wrap = toolCards.get(id);
+  if (!wrap) return;
+  let full = (toolOutputs.get(id) ?? "") + delta;
+  if (full.length > OUTPUT_KEEP_CHARS) full = full.slice(-OUTPUT_KEEP_CHARS);
+  toolOutputs.set(id, full);
+  let box = wrap.querySelector(".tool-output") as HTMLElement | null;
+  if (!box) {
+    box = el("div", "tool-output");
+    box.title = "Click to view the full output";
+    box.onclick = () => showOutputSheet(id);
+    wrap.appendChild(box);
+  }
+  const lines = full.replace(/\n+$/, "").split("\n");
+  box.textContent = lines.slice(-OUTPUT_PREVIEW_LINES).join("\n");
+  box.dataset.more = lines.length > OUTPUT_PREVIEW_LINES ? "1" : "";
+  scrollToBottom();
+}
+
+function showOutputSheet(id: string) {
+  const text = toolOutputs.get(id);
+  if (!text) return;
+  const sheet = openSheet();
+  sheet.classList.add("sheet-xl");
+  sheetHead(sheet, "Output");
+  const body = el("div", "code-body");
+  const pre = el("pre", "code-full output-full");
+  pre.textContent = text;
+  body.appendChild(pre);
+  sheet.appendChild(body);
+}
+
 function addStatus(message: string) {
   messagesEl.appendChild(el("div", "status-line", message));
   scrollToBottom();
@@ -664,11 +729,28 @@ function showApproval(p: ApprovalPayload) {
   head.appendChild(el("span", "approval-kind", p.kind));
   card.appendChild(head);
   card.appendChild(el("div", "approval-subject", p.subject));
-  if (p.diff && p.diff.rows.length) {
-    card.appendChild(renderDiff(p.diff, false));
+  if (p.diffs && p.diffs.length) {
+    // Multi-file patch: one compact preview per file, each expandable.
+    const list = el("div", "approval-diffs");
+    for (const d of p.diffs) list.appendChild(renderDiffPreview(d));
+    card.appendChild(list);
+  } else if (p.diff && p.diff.rows.length) {
+    card.appendChild(renderDiffPreview(p.diff));
   } else if (p.detail) {
+    const detail = p.detail;
     const pre = el("pre", "approval-detail");
-    pre.textContent = p.detail;
+    pre.textContent = detail;
+    pre.title = "Click to view in full";
+    pre.onclick = () => {
+      const sheet = openSheet();
+      sheet.classList.add("sheet-xl");
+      sheetHead(sheet, p.subject);
+      const body = el("div", "code-body");
+      const full = el("pre", "code-full output-full");
+      full.textContent = detail;
+      body.appendChild(full);
+      sheet.appendChild(body);
+    };
     card.appendChild(pre);
   }
   const actions = el("div", "approval-actions");
@@ -1738,6 +1820,7 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       lastTurnUsage = null;
       turnsCompleted = 0;
       currentTasks = [];
+      toolOutputs.clear();
       renderTasks([]);
       closeMention();
       updateMeter();
@@ -1845,6 +1928,9 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       if (state.running) {
         thinkCountEl.textContent = `~${fmtTokens(msg.tokens)} tok`;
       }
+      break;
+    case "toolOutput":
+      appendToolOutput(msg.id, msg.delta);
       break;
     case "error":
       thinking = false;
