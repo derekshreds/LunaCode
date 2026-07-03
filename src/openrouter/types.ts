@@ -68,6 +68,8 @@ export interface ToolDefinition {
 
 export interface ChatCompletionRequest {
   model: string;
+  /** OpenRouter fallback routing: models tried in order. */
+  models?: string[];
   messages: ChatMessage[];
   tools?: ToolDefinition[];
   tool_choice?: "auto" | "none" | "required";
@@ -97,6 +99,7 @@ export interface Usage {
 
 // Discriminated events emitted by the streaming client.
 export type StreamEvent =
+  | { type: "model"; id: string } // served by a fallback model
   | { type: "text"; delta: string }
   | { type: "reasoning"; delta: string }
   | { type: "tool_call_start"; index: number; id: string; name: string }

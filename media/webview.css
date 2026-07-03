@@ -1123,3 +1123,589 @@ summary.diff-head::-webkit-details-marker {
   color: var(--text-dim);
   margin: 0 0 16px;
 }
+
+/* ---------- Settings sheet ---------- */
+.settings-body {
+  padding: 12px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+.set-group {
+  margin-bottom: 18px;
+}
+.set-group-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--accent-bright);
+  margin-bottom: 6px;
+}
+.set-row {
+  display: flex;
+  /* Wrap so controls drop below the label instead of clipping when the
+     sidebar is narrow. */
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 14px;
+  padding: 9px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  margin-bottom: 6px;
+}
+.set-meta {
+  flex: 1 1 170px;
+  min-width: 0;
+}
+.set-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.set-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+.set-control {
+  display: flex;
+  align-items: center;
+  /* Never wider than the row — wraps to its own full-width line instead. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+.set-input {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 8px;
+  width: 200px;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  font-family: inherit;
+}
+.set-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.set-num {
+  width: 100px;
+}
+.set-select {
+  width: auto;
+  max-width: 100%;
+  /* Long option labels otherwise force the select past the container. */
+  text-overflow: ellipsis;
+}
+.set-list {
+  width: 220px;
+  resize: vertical;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.set-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+}
+.set-inline .set-input {
+  width: 150px;
+  flex: 1 1 120px;
+}
+.set-browse {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 11px;
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.set-browse:hover {
+  border-color: var(--accent);
+}
+.set-toggle {
+  position: relative;
+  display: inline-block;
+  width: 34px;
+  height: 19px;
+  cursor: pointer;
+}
+.set-toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.set-toggle-track {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 999px;
+  transition: background 0.15s;
+}
+.set-toggle-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--text);
+  transition: transform 0.15s;
+}
+.set-toggle input:checked + .set-toggle-track {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+.set-toggle input:checked + .set-toggle-track::after {
+  transform: translateX(15px);
+  background: white;
+}
+.set-slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 200px;
+}
+.set-slider input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+.set-slider-val {
+  font-size: 11px;
+  color: var(--text);
+  min-width: 32px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Cache warmth dot in the meter */
+.cache-dot {
+  font-size: 9px;
+  cursor: help;
+}
+.cache-dot.warm {
+  color: #34d399;
+}
+.cache-dot.cold {
+  color: var(--text-dim);
+  opacity: 0.6;
+}
+
+/* Revert-turn chip in the meter */
+.revert-chip {
+  cursor: pointer;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+  transition: all 0.15s;
+  user-select: none;
+}
+.revert-chip:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.set-json {
+  width: 260px;
+}
+
+/* ---------- Task checklist ---------- */
+.tasks {
+  margin: 0 12px 4px;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  max-height: 140px;
+  overflow-y: auto;
+}
+.tasks.hidden {
+  display: none;
+}
+.tasks-head {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: var(--accent-bright);
+  margin-bottom: 4px;
+}
+.task {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+.task.active {
+  color: var(--text);
+  font-weight: 600;
+}
+.task.done {
+  color: var(--text-dim);
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+.task-icon {
+  width: 12px;
+  flex-shrink: 0;
+  text-align: center;
+}
+.task.done .task-icon {
+  color: #34d399;
+  text-decoration: none;
+}
+.task.active .task-icon {
+  color: var(--accent-bright);
+}
+
+/* ---------- @-mention dropdown ---------- */
+.composer {
+  position: relative;
+}
+.mention {
+  position: absolute;
+  bottom: 100%;
+  left: 12px;
+  right: 12px;
+  margin-bottom: 4px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  max-height: 200px;
+  overflow-y: auto;
+  z-index: 40;
+  box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.4);
+}
+.mention.hidden {
+  display: none;
+}
+.mention-item {
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+.mention-item.sel,
+.mention-item:hover {
+  background: var(--bg-elev);
+  color: var(--text);
+}
+
+/* ---------- Context inspector ---------- */
+.ctx-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px;
+  font-size: 11.5px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.ctx-role {
+  color: var(--accent-bright);
+  font-weight: 600;
+  width: 64px;
+  flex-shrink: 0;
+}
+.ctx-preview {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ctx-tokens {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.meter-session {
+  cursor: pointer;
+}
+
+/* Collapsible plan */
+.tasks-head {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tasks.collapsed {
+  padding: 5px 10px;
+}
+.tasks.collapsed .tasks-head {
+  margin-bottom: 0;
+}
+.tasks-chevron {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+/* Capped code previews — click a clipped block to see the whole thing */
+.assistant-body pre,
+.code-block {
+  max-height: 260px;
+  overflow: hidden;
+  position: relative;
+}
+.assistant-body pre.clipped,
+.code-block.clipped {
+  cursor: pointer;
+}
+.clipped::after {
+  content: "··· click to expand";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  text-align: center;
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  color: var(--text-dim);
+  padding: 26px 0 4px;
+  background: linear-gradient(transparent, var(--bg-elev) 72%);
+  pointer-events: none;
+}
+.code-full,
+.code-full.code-block,
+.assistant-body .code-full {
+  max-height: none !important;
+  overflow: auto !important;
+  cursor: auto;
+}
+.code-full::after {
+  display: none;
+}
+/* The expanded sheet clone may be a bare <pre> without block styling. */
+pre.code-full {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* ---------- Actions menu (replaces one-glyph meter chips) ---------- */
+.actions-menu {
+  position: absolute;
+  bottom: 100%;
+  right: 12px;
+  margin-bottom: 4px;
+  width: 300px;
+  max-width: calc(100% - 24px);
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  z-index: 45;
+  box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.actions-menu.hidden {
+  display: none;
+}
+.actions-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-soft);
+}
+.actions-item:last-child {
+  border-bottom: none;
+}
+.actions-item:hover:not(.disabled) {
+  background: var(--bg-elev);
+}
+.actions-item.disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.actions-icon {
+  width: 16px;
+  text-align: center;
+  color: var(--accent-bright);
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.actions-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.actions-hint {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+/* ---------- Live token counter in the activity bar ---------- */
+.think-count {
+  margin-left: 8px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Image attachments ---------- */
+.attach {
+  display: flex;
+  gap: 6px;
+  padding: 8px 8px 0;
+  flex-wrap: wrap;
+}
+.attach.hidden {
+  display: none;
+}
+.attach-chip {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.attach-chip img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.attach-x {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--text);
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Counter pinned right so the rotating label's width can't bounce it around. */
+.think-count {
+  margin-left: auto;
+  min-width: 76px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* Diff previews and single-column (new file) mode */
+.diff-body.single {
+  grid-template-columns: auto 1fr;
+}
+.diff-preview {
+  cursor: pointer;
+}
+.diff-preview .diff-body {
+  max-height: none;
+  overflow: hidden;
+}
+.diff-preview:hover {
+  border-color: var(--accent);
+}
+.diff-more {
+  font-size: 10px;
+  color: var(--text-dim);
+  text-align: center;
+  padding: 3px 0 4px;
+  border-top: 1px solid var(--border-soft);
+  letter-spacing: 0.3px;
+}
+.diff-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent-bright);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 5px;
+  margin-right: 6px;
+}
+/* Inside sheets the sheet body scrolls — let the diff grow naturally. */
+.usage-body .diff-body {
+  max-height: none;
+  overflow: visible;
+}
+
+/* Extra-wide sheet for code/diff viewing — nearly the whole window. */
+.sheet-xl {
+  width: 95%;
+  max-width: 95%;
+  max-height: 90vh;
+}
+/* Flat body for code/diff sheets: no box-in-a-box, content gets full width. */
+.code-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0;
+}
+.code-body .code-full,
+.code-body .diff {
+  border: none;
+  border-radius: 0;
+  margin: 0;
+  max-height: none;
+}
+.code-body pre.code-full,
+.code-body .code-full {
+  background: var(--bg-elev);
+  overflow: visible;
+  width: 100%;
+}
+.code-body .diff-body {
+  max-height: none;
+  overflow: visible;
+}
+
+/* Stats inline in the sheet head (single top bar for code/diff sheets). */
+.sheet-stat {
+  margin-left: auto;
+  margin-right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+/* Inside a sheet, the head names the language — hide the block's own badge. */
+.code-body .code-block[data-lang]::before,
+.code-body pre[data-lang]::before {
+  display: none;
+}

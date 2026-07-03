@@ -30,6 +30,12 @@ export interface ToolContext {
   signal: AbortSignal;
   /** Output channel for verbose diagnostics. */
   output: vscode.OutputChannel;
+  /**
+   * Run a research question through a disposable sub-agent and return its
+   * digest. Injected by the main Agent only — absent inside sub-agents, so
+   * explore can never recurse.
+   */
+  explore?(question: string): Promise<string>;
 }
 
 export interface ToolResult {

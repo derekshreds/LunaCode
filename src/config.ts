@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { AgentMode, isMode } from "./modes";
+import { McpServerConfig } from "./mcp/client";
 
 const SECRET_KEY = "lunacode.openrouter.apiKey";
 
@@ -11,10 +12,22 @@ export interface LunaCodeConfig {
   temperature: number;
   enablePromptCaching: boolean;
   maxContextTokens: number;
+  autoBudgetCarryCostUsd: number;
+  compactionTargetRatio: number;
+  summarizerModel: string;
+  subagentModel: string;
+  fallbackModels: string[];
+  prewarmCache: boolean;
+  sessionBudgetUsd: number;
+  includeActiveFile: boolean;
+  formatAfterEdit: boolean;
+  worktreeMode: boolean;
+  customCommands: Record<string, string>;
   autoApproveCommands: string[];
   alwaysDenyCommands: string[];
   dataCollection: "deny" | "allow";
   zeroDataRetention: boolean;
+  mcpServers: Record<string, McpServerConfig>;
 }
 
 export function getConfig(): LunaCodeConfig {
@@ -27,12 +40,28 @@ export function getConfig(): LunaCodeConfig {
     maxTokens: c.get<number>("maxTokens", 0),
     temperature: c.get<number>("temperature", 0),
     enablePromptCaching: c.get<boolean>("enablePromptCaching", true),
-    maxContextTokens: c.get<number>("maxContextTokens", 180000),
+    maxContextTokens: c.get<number>("maxContextTokens", 0),
+    autoBudgetCarryCostUsd: clamp(c.get<number>("autoBudgetCarryCostUsd", 0.1), 0.01, 2, 0.1),
+    compactionTargetRatio: clamp(c.get<number>("compactionTargetRatio", 0.45), 0.2, 0.8, 0.45),
+    summarizerModel: c.get<string>("summarizerModel", "").trim(),
+    subagentModel: c.get<string>("subagentModel", "").trim(),
+    fallbackModels: (c.get<string[]>("fallbackModels", []) ?? []).filter(Boolean),
+    prewarmCache: c.get<boolean>("prewarmCache", false),
+    sessionBudgetUsd: Math.max(0, c.get<number>("sessionBudgetUsd", 0) || 0),
+    includeActiveFile: c.get<boolean>("includeActiveFile", true),
+    formatAfterEdit: c.get<boolean>("formatAfterEdit", false),
+    worktreeMode: c.get<boolean>("worktreeMode", false),
+    customCommands: c.get<Record<string, string>>("customCommands", {}) ?? {},
     autoApproveCommands: c.get<string[]>("autoApproveCommands", []),
     alwaysDenyCommands: c.get<string[]>("alwaysDenyCommands", []),
     dataCollection: c.get<string>("dataCollection", "deny") === "allow" ? "allow" : "deny",
     zeroDataRetention: c.get<boolean>("zeroDataRetention", false),
+    mcpServers: c.get<Record<string, McpServerConfig>>("mcpServers", {}) ?? {},
   };
+}
+
+function clamp(n: number, lo: number, hi: number, fallback: number): number {
+  return Math.min(hi, Math.max(lo, Number.isFinite(n) ? n : fallback));
 }
 
 export async function setModel(model: string): Promise<void> {

@@ -14,6 +14,41 @@ export interface OpenRouterClientOptions {
   dataCollection?: "deny" | "allow";
   /** Enforce Zero Data Retention endpoints only. */
   zdr?: boolean;
+  /** Models to fall back to (OpenRouter `models` routing) when the primary
+   * model errors or is unavailable. */
+  fallbackModels?: string[];
+}
+
+/** Retry transient HTTP failures (429/5xx/network) before the stream starts. */
+const MAX_ATTEMPTS = 3;
+const RETRY_BASE_MS = 1000;
+/** Abort a stream that produces no bytes for this long. */
+const STALL_TIMEOUT_MS = 120_000;
+
+/** True when `served` is `configured` or a versioned/variant slug of it
+ * (e.g. "vendor/model-20260616" or "vendor/model:free" for "vendor/model"). */
+function sameModel(served: string, configured: string): boolean {
+  return (
+    served === configured ||
+    served.startsWith(configured + "-") ||
+    served.startsWith(configured + ":") ||
+    configured.startsWith(served + "-") ||
+    configured.startsWith(served + ":")
+  );
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true }
+    );
+  });
 }
 
 export interface CompletionParams {
@@ -22,6 +57,8 @@ export interface CompletionParams {
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
+  /** Override the client's configured model for this call (e.g. summarizer). */
+  model?: string;
 }
 
 /**
@@ -54,8 +91,17 @@ export class OpenRouterClient {
 
   /** Stream a chat completion, yielding normalized events. */
   async *stream(params: CompletionParams): AsyncGenerator<StreamEvent> {
+    const primary = params.model ?? this.opts.model;
+    // OpenRouter fallback routing: try each model in order. Only applied to
+    // the main session model — explicit per-call overrides (summarizer,
+    // sub-agent) run exactly the model they asked for.
+    const fallbacks =
+      !params.model && this.opts.fallbackModels?.length
+        ? this.opts.fallbackModels.filter((m) => m && m !== primary)
+        : [];
     const body: ChatCompletionRequest = {
-      model: this.opts.model,
+      model: primary,
+      models: fallbacks.length ? [primary, ...fallbacks] : undefined,
       messages: params.messages,
       tools: params.tools,
       tool_choice: params.tools && params.tools.length ? "auto" : undefined,
@@ -70,28 +116,52 @@ export class OpenRouterClient {
       zdr: this.opts.zdr ? true : undefined,
     };
 
-    let res: Response;
-    try {
-      res = await fetch(`${this.opts.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body),
-        signal: params.signal,
-      });
-    } catch (e: any) {
-      if (e?.name === "AbortError") {
-        yield { type: "done", finishReason: "aborted" };
+    // Transient failures BEFORE any bytes stream are safe to retry with
+    // backoff (429 / 5xx / network). Mid-stream failures are never retried.
+    let res: Response | undefined;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        res = await fetch(`${this.opts.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify(body),
+          signal: params.signal,
+        });
+      } catch (e: any) {
+        if (e?.name === "AbortError") {
+          yield { type: "done", finishReason: "aborted" };
+          return;
+        }
+        if (attempt < MAX_ATTEMPTS) {
+          try {
+            await sleep(RETRY_BASE_MS * attempt, params.signal);
+          } catch {
+            yield { type: "done", finishReason: "aborted" };
+            return;
+          }
+          continue;
+        }
+        yield { type: "error", message: `Network error: ${e?.message ?? e}` };
         return;
       }
-      yield { type: "error", message: `Network error: ${e?.message ?? e}` };
-      return;
+      const retryable = res.status === 429 || res.status >= 500;
+      if ((!res.ok || !res.body) && retryable && attempt < MAX_ATTEMPTS) {
+        await safeText(res); // drain
+        try {
+          await sleep(RETRY_BASE_MS * attempt, params.signal);
+        } catch {
+          yield { type: "done", finishReason: "aborted" };
+          return;
+        }
+        continue;
+      }
+      break;
     }
-
-    if (!res.ok || !res.body) {
-      const text = await safeText(res);
+    if (!res || !res.ok || !res.body) {
+      const text = res ? await safeText(res) : "";
       yield {
         type: "error",
-        message: `OpenRouter ${res.status}: ${text || res.statusText}`,
+        message: `OpenRouter ${res?.status ?? "?"}: ${text || res?.statusText || "no response"}`,
       };
       return;
     }
@@ -100,6 +170,7 @@ export class OpenRouterClient {
     const decoder = new TextDecoder();
     let buffer = "";
     let finishReason: string | null = null;
+    let servedModel: string | null = null;
 
     // Parse a single SSE line into events. `terminal` means stop the stream.
     const handleLine = (
@@ -123,6 +194,21 @@ export class OpenRouterClient {
           message: json.error.message ?? JSON.stringify(json.error),
         });
         return { events, terminal: true };
+      }
+      // Surface which model actually served the request — ONLY when fallback
+      // routing is configured and the served model is one of the fallbacks.
+      // Providers report versioned slugs (e.g. "vendor/model-20260616" for
+      // "vendor/model"), so a bare string mismatch is NOT a fallback.
+      if (
+        fallbacks.length &&
+        typeof json.model === "string" &&
+        json.model &&
+        json.model !== servedModel
+      ) {
+        servedModel = json.model;
+        if (!sameModel(json.model, primary) && fallbacks.some((f) => sameModel(json.model, f))) {
+          events.push({ type: "model", id: json.model });
+        }
       }
       const choice = json.choices?.[0];
       if (choice) {
@@ -158,8 +244,24 @@ export class OpenRouterClient {
 
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        // Watchdog: a stream that produces no bytes for STALL_TIMEOUT_MS is
+        // treated as hung so the UI never spins forever.
+        let stallTimer: ReturnType<typeof setTimeout> | undefined;
+        const stall = new Promise<never>((_, reject) => {
+          stallTimer = setTimeout(
+            () => reject(new Error(`No data from the provider for ${STALL_TIMEOUT_MS / 1000}s — stream appears hung.`)),
+            STALL_TIMEOUT_MS
+          );
+        });
+        let done: boolean;
+        let value: Uint8Array | undefined;
+        try {
+          ({ done, value } = await Promise.race([reader.read(), stall]));
+        } finally {
+          clearTimeout(stallTimer);
+        }
         if (done) break;
+        if (!value) continue;
         buffer += decoder.decode(value, { stream: true });
 
         let nlIndex: number;
@@ -193,6 +295,28 @@ export class OpenRouterClient {
         /* ignore */
       }
     }
+  }
+
+  /**
+   * Run a completion to the end and return the accumulated text. Reuses the
+   * SSE path so abort/error semantics match stream(). Never throws — errors
+   * are reported via the `error` field.
+   */
+  async complete(
+    params: CompletionParams
+  ): Promise<{ text: string; usage?: Usage; error?: string }> {
+    let text = "";
+    let usage: Usage | undefined;
+    let error: string | undefined;
+    for await (const ev of this.stream(params)) {
+      if (ev.type === "text") text += ev.delta;
+      else if (ev.type === "usage") usage = ev.usage;
+      else if (ev.type === "error") {
+        error = ev.message;
+        break;
+      }
+    }
+    return { text, usage, error };
   }
 
   /** Fetch the list of available models from OpenRouter. */

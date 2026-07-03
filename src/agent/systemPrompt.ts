@@ -7,6 +7,8 @@ export interface SystemPromptParams {
   shell: string;
   /** A short snapshot of the workspace (top-level entries). */
   workspaceOverview?: string;
+  /** Contents of the project memory file (LUNA.md), if present. */
+  projectMemory?: string;
 }
 
 /**
@@ -31,8 +33,15 @@ export function buildSystemPrompt(p: SystemPromptParams): string {
 - Use read_file before edit_file so your old_string matches exactly (including whitespace).
 - edit_file is preferred for changing existing files; write_file is for new files or full rewrites.
 - Prefer ripgrep-style targeted searches (grep with a glob) over reading many whole files.
+- For large files, call file_outline first to see symbols and line ranges, then read_file with offset/limit to pull only the range you need — do not read whole large files when a slice will do.
+- ALWAYS batch independent read-only lookups (read_file, grep, glob, list_dir, file_outline) into a SINGLE response with multiple tool calls — they run in parallel, and each extra round-trip re-sends the whole conversation. One response with 6 reads is dramatically cheaper and faster than 6 responses with 1 read.
+- Use the explore tool for open-ended research questions ("how does X work in this repo?", "where is Y handled?") — it investigates in a separate context and returns a digest, keeping this conversation small. Prefer it over long chains of grep/read when you need understanding rather than a specific line.
 - run_command is for builds, tests, git, and package managers. Keep commands non-interactive.
-- Batch independent read-only lookups when possible to move quickly.
+- For any task with 3+ steps, call set_tasks with your plan first, keep exactly one task 'active', and update it as you complete steps — the user sees this as a live checklist. Statuses only move forward (pending → active → done): NEVER send a completed task back to pending, and when the work is finished your final set_tasks call must mark every completed task 'done'. Only send a fresh all-pending list when starting a genuinely new plan.
+- After write_file/edit_file, that file's language-server errors are appended to the tool result automatically — fix them before moving on; don't call get_diagnostics for the same file again.
+
+# Project memory
+If the workspace has a LUNA.md file, it is your persistent project memory (conventions, build commands, architecture notes, gotchas). It is loaded below when present. When you learn something durable and non-obvious about this project — a convention, a footgun, the correct build/test invocation — add or update a short note in LUNA.md with edit_file. Keep it terse; never store secrets.
 
 # Code references
 When you mention a location, use the form path/to/file.ts:LINE so the user can click it.
@@ -42,6 +51,7 @@ When you mention a location, use the form path/to/file.ts:LINE so the user can c
 - Shell: ${p.shell}
 - Workspace root: ${p.workspaceRoot}
 ${p.workspaceOverview ? `\n# Workspace overview\n${p.workspaceOverview}` : ""}
+${p.projectMemory ? `\n# Project memory (LUNA.md)\n${p.projectMemory}` : ""}
 
 # Current mode: ${p.mode.toUpperCase()}
 ${modeRules}`;

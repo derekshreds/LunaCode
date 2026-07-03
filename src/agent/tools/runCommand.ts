@@ -26,7 +26,7 @@ function classifyCommand(cmd: string): "safe" | "risky" {
   return "risky";
 }
 
-function isBlocked(cmd: string): string | null {
+export function isBlocked(cmd: string): string | null {
   const cfg = getConfig();
   for (const bad of cfg.alwaysDenyCommands) {
     if (cmd.includes(bad)) return bad;
