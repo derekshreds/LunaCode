@@ -6,6 +6,47 @@ import {
   TextPart,
 } from "../openrouter/types";
 
+export interface CompactionOptions {
+  /** Fraction of the budget to compact down to (the "floor"). */
+  targetRatio: number;
+  /** Summarize a span of messages into a checkpoint; null on any failure. */
+  summarize?: (span: ChatMessage[]) => Promise<{ text: string } | null>;
+}
+
+export interface CompactionResult {
+  tokensSaved: number;
+  summarized: boolean;
+  deduped: number;
+}
+
+/** Read-only / re-runnable tools whose repeated identical results are safe to
+ * supersede (latest occurrence wins). */
+const DEDUPE_TOOLS = new Set([
+  "read_file",
+  "list_dir",
+  "glob",
+  "grep",
+  "run_command",
+  "get_diagnostics",
+]);
+
+/** Token headroom reserved for the checkpoint summary that replaces a span. */
+const SUMMARY_ALLOWANCE_TOKENS = 800;
+
+/** Stable stringify (sorted keys) so arg order never splits identity keys. */
+function canonicalizeArgs(args: any): string {
+  if (args === null || typeof args !== "object") return JSON.stringify(args);
+  if (Array.isArray(args)) return "[" + args.map(canonicalizeArgs).join(",") + "]";
+  return (
+    "{" +
+    Object.keys(args)
+      .sort()
+      .map((k) => JSON.stringify(k) + ":" + canonicalizeArgs(args[k]))
+      .join(",") +
+    "}"
+  );
+}
+
 /** Rough token estimate: ~4 chars per token. */
 export function estimateTokens(messages: ChatMessage[]): number {
   let chars = 0;
@@ -71,7 +112,15 @@ export class ContextManager {
     this.messages = messages.map((m) => ({ ...m }));
   }
 
-  addUser(text: string) {
+  addUser(text: string, images?: string[]) {
+    if (images && images.length) {
+      const parts: ContentPart[] = [{ type: "text", text }];
+      for (const url of images) {
+        parts.push({ type: "image_url", image_url: { url } });
+      }
+      this.messages.push({ role: "user", content: parts });
+      return;
+    }
     this.messages.push({ role: "user", content: text });
   }
 
@@ -90,53 +139,170 @@ export class ContextManager {
   }
 
   /**
-   * Compact the history when it exceeds the budget. Strategy: first shrink large
-   * tool results in the older half, then, if still over, drop the oldest
-   * turn-pairs and insert a synthetic notice. The first user message is kept so
-   * the original intent survives.
+   * Compact the history when it exceeds the budget.
+   *
+   * This is an EVENT, not a steady-state trimmer: between events the history is
+   * append-only so the provider's prompt cache stays valid (reads at ~0.1x input
+   * price). When the estimate crosses `maxTokens` we pay one cache miss and
+   * drive the context all the way down to `maxTokens * targetRatio`, so the
+   * next event is many turns away. All lossy operations (dedup, summarize,
+   * truncate) are batched inside the event because the cache is invalidated at
+   * that moment anyway.
    */
-  compactIfNeeded(maxTokens: number): boolean {
-    if (this.estimate() <= maxTokens) return false;
-    let compacted = false;
+  async compactIfNeeded(
+    maxTokens: number,
+    opts: CompactionOptions
+  ): Promise<CompactionResult | null> {
+    if (this.estimate() <= maxTokens) return null;
+    const before = this.estimate();
+    const target = Math.floor(maxTokens * opts.targetRatio);
 
-    // Phase 1: truncate big tool outputs in the older 60% of the conversation.
-    const cutoff = Math.floor(this.messages.length * 0.6);
-    for (let i = 0; i < cutoff; i++) {
-      const m = this.messages[i];
-      if (m.role === "tool" && typeof m.content === "string" && m.content.length > 1500) {
-        m.content =
-          m.content.slice(0, 1200) +
-          `\n…[older tool output truncated to save context]`;
-        compacted = true;
+    // Pass A: supersede stale duplicate tool results (latest occurrence wins).
+    const deduped = this.dedupeStaleToolResults();
+
+    // Pass B: summarize-and-replace the oldest span down to the target floor.
+    // Run it even if Pass A already got under maxTokens — stopping just under
+    // the trigger would fire another (cache-missing) event a few turns later.
+    let summarized = false;
+    const span = this.selectCompactionSpan(target);
+    if (span) {
+      const spanMessages = this.messages.slice(span.start, span.end);
+      const summary = opts.summarize ? await opts.summarize(spanMessages) : null;
+      if (summary && summary.text.trim().length > 0) {
+        this.messages.splice(span.start, span.end - span.start, {
+          role: "assistant",
+          content:
+            "[Luna Code checkpoint — earlier conversation summarized]\n" +
+            summary.text.trim(),
+        });
+        summarized = true;
+      } else {
+        this.legacyCompact(span.start, target);
       }
     }
-    if (this.estimate() <= maxTokens) return compacted;
 
-    // Phase 2: drop the oldest messages after the first user message until under
-    // budget, then insert ONE synthetic assistant note in their place.
-    //
-    // Two invariants must hold afterwards or the API will 400:
-    //   (a) no `tool` message may lead the dropped region's boundary (a tool
-    //       result must always follow the assistant that requested it), and
-    //   (b) we must not create two consecutive `user` messages.
-    // Removing leading `tool` messages whenever they surface satisfies (a);
-    // inserting an assistant note as the replacement satisfies (b).
+    // Emergency: giant tool results in the protected tail can keep us over the
+    // hard budget. Truncate tail tool outputs oldest-first until under.
+    if (this.estimate() > maxTokens) {
+      for (const m of this.messages) {
+        if (this.estimate() <= maxTokens) break;
+        if (m.role === "tool" && typeof m.content === "string" && m.content.length > 1500) {
+          m.content =
+            m.content.slice(0, 1200) + `\n…[older tool output truncated to save context]`;
+        }
+      }
+    }
+
+    return {
+      tokensSaved: Math.max(0, before - this.estimate()),
+      summarized,
+      deduped,
+    };
+  }
+
+  /**
+   * Replace all-but-the-latest results of repeated identical read-only tool
+   * calls with a one-line stub. Identity is derived from the paired assistant
+   * `tool_calls` (name + canonicalized args), so it works for live and
+   * persisted sessions alike. Content-only replacement — message roles and
+   * ordering are untouched, so API invariants hold.
+   */
+  private dedupeStaleToolResults(): number {
+    const callInfo = new Map<string, string>(); // tool_call_id -> identity key
+    const callLabel = new Map<string, string>(); // tool_call_id -> human label
+    for (const m of this.messages) {
+      if (m.role !== "assistant" || !("tool_calls" in m) || !m.tool_calls) continue;
+      for (const tc of m.tool_calls) {
+        if (!DEDUPE_TOOLS.has(tc.function.name)) continue;
+        try {
+          const args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+          const key = tc.function.name + "|" + canonicalizeArgs(args);
+          callInfo.set(tc.id, key);
+          const primary = args.path ?? args.pattern ?? args.command ?? "";
+          callLabel.set(tc.id, `${tc.function.name} ${primary}`.trim());
+        } catch {
+          // Unparsable args: never stub blindly.
+        }
+      }
+    }
+
+    // Group tool-result message indexes by identity key, in order.
+    const groups = new Map<string, number[]>();
+    for (let i = 0; i < this.messages.length; i++) {
+      const m = this.messages[i];
+      if (m.role !== "tool") continue;
+      const key = callInfo.get(m.tool_call_id);
+      if (!key) continue;
+      const list = groups.get(key);
+      if (list) list.push(i);
+      else groups.set(key, [i]);
+    }
+
+    let stubbed = 0;
+    for (const indexes of groups.values()) {
+      if (indexes.length < 2) continue;
+      for (const i of indexes.slice(0, -1)) {
+        const m = this.messages[i];
+        if (m.role !== "tool" || typeof m.content !== "string") continue;
+        if (m.content.startsWith("[superseded:")) continue;
+        const label = callLabel.get(m.tool_call_id) ?? "this call";
+        m.content = `[superseded: ${label} was re-run later in this conversation — see the newer result]`;
+        stubbed++;
+      }
+    }
+    return stubbed;
+  }
+
+  /**
+   * Choose the span [start, end) of oldest messages to summarize away. Keeps
+   * the first user message (original intent) and everything from the last user
+   * message onward (the active task). Extends past orphaned tool results so
+   * the first kept message never leads with role "tool".
+   */
+  private selectCompactionSpan(target: number): { start: number; end: number } | null {
     const firstUserIdx = this.messages.findIndex((m) => m.role === "user");
-    if (firstUserIdx < 0) return compacted;
+    if (firstUserIdx < 0) return null;
+    const lastUserIdx = this.lastUserIndex();
     const start = firstUserIdx + 1;
+    if (lastUserIdx <= start) return null;
+
+    const overage = this.estimate() - target;
+    let spanTokens = 0;
+    let end = start;
+    while (end < lastUserIdx && spanTokens - SUMMARY_ALLOWANCE_TOKENS < overage) {
+      spanTokens += Math.ceil(messageChars(this.messages[end]) / 4);
+      end++;
+    }
+    // Never strand a tool result at the new boundary.
+    while (end < lastUserIdx && this.messages[end]?.role === "tool") end++;
+
+    // Not worth a summarizer round-trip (and the summary could outweigh the
+    // removed content) — let the emergency path handle tail-heavy overage.
+    if (end - start < 2 || spanTokens < SUMMARY_ALLOWANCE_TOKENS * 2) return null;
+    return { start, end };
+  }
+
+  /** Fallback when no summary is available: truncate then drop to target. */
+  private legacyCompact(start: number, target: number) {
+    // Truncate big tool outputs first (cheapest loss).
+    for (const m of this.messages) {
+      if (this.estimate() <= target) break;
+      if (m === this.messages[this.lastUserIndex()]) break;
+      if (m.role === "tool" && typeof m.content === "string" && m.content.length > 1500) {
+        m.content =
+          m.content.slice(0, 1200) + `\n…[older tool output truncated to save context]`;
+      }
+    }
+    // Then drop the oldest messages, sweeping orphaned tool results so a tool
+    // message never leads the boundary, and never touching the active task.
     let removedCount = 0;
-    while (this.estimate() > maxTokens && this.messages.length > start + 2) {
+    while (this.estimate() > target && start < this.lastUserIndex()) {
       this.messages.splice(start, 1);
       removedCount++;
-      // Sweep any now-orphaned tool results that bubbled to the boundary.
-      while (
-        this.messages.length > start + 1 &&
-        this.messages[start]?.role === "tool"
-      ) {
+      while (start < this.lastUserIndex() && this.messages[start]?.role === "tool") {
         this.messages.splice(start, 1);
         removedCount++;
       }
-      compacted = true;
     }
     if (removedCount > 0) {
       this.messages.splice(start, 0, {
@@ -144,21 +310,81 @@ export class ContextManager {
         content: `[Luna Code: ${removedCount} earlier message(s) were dropped to stay within the context budget. Re-read any files if you need their current contents.]`,
       });
     }
-    return compacted;
+  }
+
+  private lastUserIndex(): number {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      if (this.messages[i].role === "user") return i;
+    }
+    return -1;
   }
 
   /** Build the final messages array for an API request, with cache breakpoints. */
   render(): ChatMessage[] {
     const out: ChatMessage[] = [];
     out.push(this.renderSystem());
-    // Find the last message that actually carries text — an assistant message
-    // with only tool_calls (content null) cannot hold a breakpoint, so marking
-    // it would waste the breakpoint and defeat caching.
-    const bpIndex = this.cachingEnabled ? this.lastTextBearingIndex() : -1;
+    const bps = this.cachingEnabled ? this.breakpointIndices() : new Set<number>();
     for (let i = 0; i < this.messages.length; i++) {
-      out.push(i === bpIndex ? withCacheControl(this.messages[i]) : this.messages[i]);
+      out.push(bps.has(i) ? withCacheControl(this.messages[i]) : this.messages[i]);
     }
     return out;
+  }
+
+  /**
+   * Breakpoint placement: the rolling one on the last text-bearing message
+   * (an assistant message with only tool_calls can't hold one), PLUS up to two
+   * "anchor" breakpoints at stride positions in the older history. Providers
+   * only look back a bounded number of content blocks from a breakpoint when
+   * matching the cache — a single tool-heavy turn that appends dozens of
+   * messages can jump past the previous rolling breakpoint and silently miss.
+   * Anchors are durable read points that cap that risk. (Anthropic allows 4
+   * breakpoints total: system + 2 anchors + rolling.)
+   */
+  private breakpointIndices(): Set<number> {
+    const set = new Set<number>();
+    const rolling = this.lastTextBearingIndex();
+    if (rolling >= 0) set.add(rolling);
+    const STRIDE = 15;
+    let anchor = Math.floor((rolling - 1) / STRIDE) * STRIDE;
+    while (anchor > 0 && set.size < 3) {
+      const idx = this.textBearingAtOrBefore(Math.min(anchor, rolling - 1));
+      if (idx > 0) set.add(idx);
+      anchor -= STRIDE;
+    }
+    return set;
+  }
+
+  private textBearingAtOrBefore(start: number): number {
+    for (let i = Math.min(start, this.messages.length - 1); i >= 0; i--) {
+      const c = (this.messages[i] as any).content;
+      if (typeof c === "string" && c.length > 0) return i;
+      if (Array.isArray(c) && c.some((p: any) => p.type === "text" && p.text)) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * Remove the last user message and everything after it, returning its text
+   * and any attached images. Used by retry / edit-and-resend. Returns null
+   * when there is no user message (nothing to roll back).
+   */
+  rollbackToLastUser(): { text: string; images: string[] } | null {
+    const idx = this.lastUserIndex();
+    if (idx < 0) return null;
+    const m = this.messages[idx];
+    let text = "";
+    const images: string[] = [];
+    if (typeof m.content === "string") {
+      text = m.content;
+    } else if (Array.isArray(m.content)) {
+      for (const p of m.content as any[]) {
+        if (p?.type === "text") text += (text ? " " : "") + p.text;
+        else if (p?.type === "image_url" && p.image_url?.url) images.push(p.image_url.url);
+      }
+      text = text.trim();
+    }
+    this.messages.splice(idx);
+    return { text, images };
   }
 
   private lastTextBearingIndex(): number {

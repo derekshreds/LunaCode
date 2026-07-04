@@ -26,7 +26,7 @@ function classifyCommand(cmd: string): "safe" | "risky" {
   return "risky";
 }
 
-function isBlocked(cmd: string): string | null {
+export function isBlocked(cmd: string): string | null {
   const cfg = getConfig();
   for (const bad of cfg.alwaysDenyCommands) {
     if (cmd.includes(bad)) return bad;
@@ -128,8 +128,16 @@ export const runCommandTool: Tool = {
       };
       ctx.signal.addEventListener("abort", onAbort, { once: true });
 
-      child.stdout?.on("data", (d) => (stdout += d.toString()));
-      child.stderr?.on("data", (d) => (stderr += d.toString()));
+      child.stdout?.on("data", (d) => {
+        const s = d.toString();
+        stdout += s;
+        ctx.emitOutput?.(s);
+      });
+      child.stderr?.on("data", (d) => {
+        const s = d.toString();
+        stderr += s;
+        ctx.emitOutput?.(s);
+      });
 
       child.on("error", (err) => {
         if (settled) return;

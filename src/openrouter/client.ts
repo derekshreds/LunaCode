@@ -14,6 +14,66 @@ export interface OpenRouterClientOptions {
   dataCollection?: "deny" | "allow";
   /** Enforce Zero Data Retention endpoints only. */
   zdr?: boolean;
+  /** Models to fall back to (OpenRouter `models` routing) when the primary
+   * model errors or is unavailable. */
+  fallbackModels?: string[];
+  /** Rank providers by throughput/latency/price instead of OpenRouter's
+   * default load balancing. Throughput/latency cut down upstream idle
+   * timeouts from slow providers on big contexts. */
+  providerSort?: "throughput" | "latency" | "price";
+  /** Override the stall watchdog (ms without a data frame); for tests. */
+  stallTimeoutMs?: number;
+}
+
+/** Retry transient failures: HTTP 429/5xx/network errors before the stream
+ * starts, and mid-stream provider stalls before any content has streamed. */
+const MAX_ATTEMPTS = 3;
+const RETRY_BASE_MS = 1000;
+/** Abort a stream that produces no DATA frames for this long. Keepalive
+ * comments (": OPENROUTER PROCESSING") don't count — OpenRouter keeps
+ * sending them while an upstream provider is stalled, so a byte-level
+ * watchdog would never fire and the turn would hang forever. */
+const STALL_TIMEOUT_MS = 120_000;
+
+/** OpenRouter error-frame codes for transient provider failures (gateway
+ * timeouts, overload, rate limits) as opposed to permanent request errors. */
+const TRANSIENT_FRAME_CODES = new Set([408, 429, 500, 502, 503, 504, 522, 524]);
+
+/** True when a stream failure is transient (provider-side, worth retrying) —
+ * e.g. the 504 "Upstream idle timeout exceeded" OpenRouter emits when a
+ * provider goes silent too long (typical during long non-streamed reasoning),
+ * overload, rate limits, the stall watchdog, or a dropped connection. */
+export function isTransientFrame(message: string, code?: number): boolean {
+  if (code !== undefined) return TRANSIENT_FRAME_CODES.has(code);
+  return /timeout|timed out|overloaded|unavailable|too many|rate.?limit|try again|appears hung|no data|stall|terminated|socket|econn|network/i.test(
+    message
+  );
+}
+
+/** True when `served` is `configured` or a versioned/variant slug of it
+ * (e.g. "vendor/model-20260616" or "vendor/model:free" for "vendor/model"). */
+function sameModel(served: string, configured: string): boolean {
+  return (
+    served === configured ||
+    served.startsWith(configured + "-") ||
+    served.startsWith(configured + ":") ||
+    configured.startsWith(served + "-") ||
+    configured.startsWith(served + ":")
+  );
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true }
+    );
+  });
 }
 
 export interface CompletionParams {
@@ -22,6 +82,8 @@ export interface CompletionParams {
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
+  /** Override the client's configured model for this call (e.g. summarizer). */
+  model?: string;
 }
 
 /**
@@ -54,8 +116,17 @@ export class OpenRouterClient {
 
   /** Stream a chat completion, yielding normalized events. */
   async *stream(params: CompletionParams): AsyncGenerator<StreamEvent> {
+    const primary = params.model ?? this.opts.model;
+    // OpenRouter fallback routing: try each model in order. Only applied to
+    // the main session model — explicit per-call overrides (summarizer,
+    // sub-agent) run exactly the model they asked for.
+    const fallbacks =
+      !params.model && this.opts.fallbackModels?.length
+        ? this.opts.fallbackModels.filter((m) => m && m !== primary)
+        : [];
     const body: ChatCompletionRequest = {
-      model: this.opts.model,
+      model: primary,
+      models: fallbacks.length ? [primary, ...fallbacks] : undefined,
       messages: params.messages,
       tools: params.tools,
       tool_choice: params.tools && params.tools.length ? "auto" : undefined,
@@ -66,133 +137,313 @@ export class OpenRouterClient {
       stream: true,
       usage: { include: true },
       // Privacy routing: only use providers that don't train on/store prompts.
-      provider: { data_collection: this.opts.dataCollection ?? "deny" },
+      provider: {
+        data_collection: this.opts.dataCollection ?? "deny",
+        ...(this.opts.providerSort ? { sort: this.opts.providerSort } : {}),
+      },
       zdr: this.opts.zdr ? true : undefined,
     };
 
-    let res: Response;
-    try {
-      res = await fetch(`${this.opts.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body),
-        signal: params.signal,
-      });
-    } catch (e: any) {
-      if (e?.name === "AbortError") {
-        yield { type: "done", finishReason: "aborted" };
-        return;
-      }
-      yield { type: "error", message: `Network error: ${e?.message ?? e}` };
-      return;
-    }
+    // Failures are retried with backoff while nothing has been committed to
+    // the turn: transient HTTP errors (429/5xx/network) before the stream
+    // starts, and mid-stream failures — OpenRouter error frames like the 504
+    // "Upstream idle timeout exceeded" emitted when a provider goes silent
+    // during long reasoning, the stall watchdog, dropped connections — as
+    // long as no content has streamed. The caller only commits a turn after
+    // a clean stream, so re-issuing the request is state-safe. Streamed
+    // reasoning does NOT block a retry (it is never committed to the
+    // conversation, and hidden thinking is exactly where providers stall);
+    // streamed text, tool calls, or usage do.
+    let committed = false;
+    let servedModel: string | null = null;
 
-    if (!res.ok || !res.body) {
-      const text = await safeText(res);
-      yield {
-        type: "error",
-        message: `OpenRouter ${res.status}: ${text || res.statusText}`,
-      };
-      return;
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let finishReason: string | null = null;
-
-    // Parse a single SSE line into events. `terminal` means stop the stream.
-    const handleLine = (
-      line: string
-    ): { events: StreamEvent[]; terminal: boolean } => {
-      const events: StreamEvent[] = [];
-      const trimmed = line.trimEnd();
-      if (!trimmed || trimmed.startsWith(":")) return { events, terminal: false };
-      if (!trimmed.startsWith("data:")) return { events, terminal: false };
-      const data = trimmed.slice(5).trim();
-      if (data === "[DONE]") return { events, terminal: true };
-      let json: any;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      let res: Response;
       try {
-        json = JSON.parse(data);
-      } catch {
-        return { events, terminal: false }; // partial/incomplete frame
-      }
-      if (json.error) {
-        events.push({
-          type: "error",
-          message: json.error.message ?? JSON.stringify(json.error),
+        res = await fetch(`${this.opts.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify(body),
+          signal: params.signal,
         });
-        return { events, terminal: true };
+      } catch (e: any) {
+        if (e?.name === "AbortError") {
+          yield { type: "done", finishReason: "aborted" };
+          return;
+        }
+        if (attempt >= MAX_ATTEMPTS) {
+          yield { type: "error", message: `Network error: ${e?.message ?? e}` };
+          return;
+        }
+        yield {
+          type: "retry",
+          attempt,
+          maxAttempts: MAX_ATTEMPTS,
+          reason: `Network error: ${e?.message ?? e}`,
+        };
+        try {
+          await sleep(RETRY_BASE_MS * attempt, params.signal);
+        } catch {
+          yield { type: "done", finishReason: "aborted" };
+          return;
+        }
+        continue;
       }
-      const choice = json.choices?.[0];
-      if (choice) {
-        const delta = choice.delta ?? {};
-        if (typeof delta.content === "string" && delta.content.length) {
-          events.push({ type: "text", delta: delta.content });
+      if (!res.ok || !res.body) {
+        const retryable = res.status === 408 || res.status === 429 || res.status >= 500;
+        const text = await safeText(res); // read the error (and drain the body)
+        if (!retryable || attempt >= MAX_ATTEMPTS) {
+          yield {
+            type: "error",
+            message: `OpenRouter ${res.status}: ${text || res.statusText || "no response"}`,
+          };
+          return;
         }
-        const reasoning = delta.reasoning ?? delta.reasoning_content;
-        if (typeof reasoning === "string" && reasoning.length) {
-          events.push({ type: "reasoning", delta: reasoning });
+        yield {
+          type: "retry",
+          attempt,
+          maxAttempts: MAX_ATTEMPTS,
+          reason: `OpenRouter HTTP ${res.status}`,
+        };
+        try {
+          await sleep(RETRY_BASE_MS * attempt, params.signal);
+        } catch {
+          yield { type: "done", finishReason: "aborted" };
+          return;
         }
-        if (Array.isArray(delta.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            const index = tc.index ?? 0;
-            if (tc.id || tc.function?.name) {
-              events.push({
-                type: "tool_call_start",
-                index,
-                id: tc.id ?? "",
-                name: tc.function?.name ?? "",
-              });
+        continue;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finishReason: string | null = null;
+      // Set when a transient mid-stream failure should re-issue the request
+      // instead of surfacing an error.
+      let retryReason: string | null = null;
+
+      // Parse a single SSE line into events. `terminal` means stop the stream;
+      // `meaningful` marks real data frames (keepalive comments are not) so
+      // the stall watchdog only counts genuine provider output.
+      const handleLine = (
+        line: string
+      ): { events: StreamEvent[]; terminal: boolean; meaningful: boolean } => {
+        const events: StreamEvent[] = [];
+        const trimmed = line.trimEnd();
+        if (!trimmed || trimmed.startsWith(":"))
+          return { events, terminal: false, meaningful: false };
+        if (!trimmed.startsWith("data:"))
+          return { events, terminal: false, meaningful: false };
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") return { events, terminal: true, meaningful: true };
+        let json: any;
+        try {
+          json = JSON.parse(data);
+        } catch {
+          // Partial/incomplete frame — still proof the provider is alive.
+          return { events, terminal: false, meaningful: true };
+        }
+        if (json.error) {
+          const code = Number(json.error.code);
+          events.push({
+            type: "error",
+            message: json.error.message ?? JSON.stringify(json.error),
+            code: Number.isFinite(code) ? code : undefined,
+          });
+          return { events, terminal: true, meaningful: true };
+        }
+        // Surface which model actually served the request — ONLY when fallback
+        // routing is configured and the served model is one of the fallbacks.
+        // Providers report versioned slugs (e.g. "vendor/model-20260616" for
+        // "vendor/model"), so a bare string mismatch is NOT a fallback.
+        if (
+          fallbacks.length &&
+          typeof json.model === "string" &&
+          json.model &&
+          json.model !== servedModel
+        ) {
+          servedModel = json.model;
+          if (!sameModel(json.model, primary) && fallbacks.some((f) => sameModel(json.model, f))) {
+            events.push({ type: "model", id: json.model });
+          }
+        }
+        const choice = json.choices?.[0];
+        if (choice) {
+          const delta = choice.delta ?? {};
+          if (typeof delta.content === "string" && delta.content.length) {
+            events.push({ type: "text", delta: delta.content });
+          }
+          const reasoning = delta.reasoning ?? delta.reasoning_content;
+          if (typeof reasoning === "string" && reasoning.length) {
+            events.push({ type: "reasoning", delta: reasoning });
+          }
+          if (Array.isArray(delta.tool_calls)) {
+            for (const tc of delta.tool_calls) {
+              const index = tc.index ?? 0;
+              if (tc.id || tc.function?.name) {
+                events.push({
+                  type: "tool_call_start",
+                  index,
+                  id: tc.id ?? "",
+                  name: tc.function?.name ?? "",
+                });
+              }
+              if (typeof tc.function?.arguments === "string" && tc.function.arguments.length) {
+                events.push({ type: "tool_call_delta", index, argsDelta: tc.function.arguments });
+              }
             }
-            if (typeof tc.function?.arguments === "string" && tc.function.arguments.length) {
-              events.push({ type: "tool_call_delta", index, argsDelta: tc.function.arguments });
+          }
+          if (choice.finish_reason) finishReason = choice.finish_reason;
+        }
+        if (json.usage) events.push({ type: "usage", usage: json.usage as Usage });
+        return { events, terminal: false, meaningful: true };
+      };
+
+      const stallMs = this.opts.stallTimeoutMs ?? STALL_TIMEOUT_MS;
+      const stallError = () =>
+        new Error(`No data from the provider for ${Math.round(stallMs / 1000)}s — stream appears hung.`);
+      // Watchdog clock: reset ONLY by data frames. Keepalive comments arrive
+      // even while the upstream provider is stalled, so counting raw bytes
+      // would let a dead stream spin forever.
+      let lastDataAt = Date.now();
+
+      try {
+        readLoop: while (true) {
+          const remaining = lastDataAt + stallMs - Date.now();
+          if (remaining <= 0) throw stallError();
+          let stallTimer: ReturnType<typeof setTimeout> | undefined;
+          const stall = new Promise<never>((_, reject) => {
+            stallTimer = setTimeout(() => reject(stallError()), remaining);
+          });
+          let done: boolean;
+          let value: Uint8Array | undefined;
+          try {
+            ({ done, value } = await Promise.race([reader.read(), stall]));
+          } finally {
+            clearTimeout(stallTimer);
+          }
+          if (done) break;
+          if (!value) continue;
+          buffer += decoder.decode(value, { stream: true });
+
+          let nlIndex: number;
+          while ((nlIndex = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nlIndex);
+            buffer = buffer.slice(nlIndex + 1);
+            const { events, terminal, meaningful } = handleLine(line);
+            if (meaningful) lastDataAt = Date.now();
+            for (const ev of events) {
+              if (
+                ev.type === "error" &&
+                !committed &&
+                attempt < MAX_ATTEMPTS &&
+                isTransientFrame(ev.message, ev.code)
+              ) {
+                retryReason = ev.message;
+                break readLoop;
+              }
+              if (
+                ev.type === "text" ||
+                ev.type === "tool_call_start" ||
+                ev.type === "tool_call_delta" ||
+                ev.type === "usage"
+              ) {
+                committed = true;
+              }
+              yield ev;
+            }
+            if (terminal) {
+              yield { type: "done", finishReason };
+              return;
             }
           }
         }
-        if (choice.finish_reason) finishReason = choice.finish_reason;
-      }
-      if (json.usage) events.push({ type: "usage", usage: json.usage as Usage });
-      return { events, terminal: false };
-    };
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let nlIndex: number;
-        while ((nlIndex = buffer.indexOf("\n")) !== -1) {
-          const line = buffer.slice(0, nlIndex);
-          buffer = buffer.slice(nlIndex + 1);
-          const { events, terminal } = handleLine(line);
-          for (const ev of events) yield ev;
-          if (terminal) {
+        if (retryReason === null) {
+          // Flush any trailing line the server sent without a final newline.
+          if (buffer.trim().length) {
+            const { events } = handleLine(buffer);
+            for (const ev of events) {
+              if (
+                ev.type === "error" &&
+                !committed &&
+                attempt < MAX_ATTEMPTS &&
+                isTransientFrame(ev.message, ev.code)
+              ) {
+                retryReason = ev.message;
+                break;
+              }
+              yield ev;
+            }
+          }
+          if (retryReason === null) {
             yield { type: "done", finishReason };
             return;
           }
         }
+      } catch (e: any) {
+        if (e?.name === "AbortError") {
+          yield { type: "done", finishReason: "aborted" };
+          return;
+        }
+        if (committed || attempt >= MAX_ATTEMPTS) {
+          yield { type: "error", message: `Stream error: ${e?.message ?? e}` };
+          return;
+        }
+        // Read failures here are connection-level (stall watchdog, reset
+        // socket) — transient by nature, so retry while uncommitted.
+        retryReason = `${e?.message ?? e}`;
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+          /* ignore */
+        }
       }
-      // Flush any trailing line the server sent without a final newline.
-      if (buffer.trim().length) {
-        const { events } = handleLine(buffer);
-        for (const ev of events) yield ev;
-      }
-      yield { type: "done", finishReason };
-    } catch (e: any) {
-      if (e?.name === "AbortError") {
-        yield { type: "done", finishReason: "aborted" };
-        return;
-      }
-      yield { type: "error", message: `Stream error: ${e?.message ?? e}` };
-    } finally {
+
+      // Transient mid-stream failure with nothing committed: drop the dead
+      // connection, back off, and re-issue the request.
       try {
-        reader.releaseLock();
+        await res.body.cancel();
       } catch {
         /* ignore */
       }
+      yield {
+        type: "retry",
+        attempt,
+        maxAttempts: MAX_ATTEMPTS,
+        reason: retryReason ?? "transient stream failure",
+      };
+      try {
+        await sleep(RETRY_BASE_MS * attempt, params.signal);
+      } catch {
+        yield { type: "done", finishReason: "aborted" };
+        return;
+      }
     }
+    // Unreachable: the final attempt always returns above.
+    yield { type: "error", message: "Retry attempts exhausted." };
+  }
+
+  /**
+   * Run a completion to the end and return the accumulated text. Reuses the
+   * SSE path so abort/error semantics match stream(). Never throws — errors
+   * are reported via the `error` field.
+   */
+  async complete(
+    params: CompletionParams
+  ): Promise<{ text: string; usage?: Usage; error?: string }> {
+    let text = "";
+    let usage: Usage | undefined;
+    let error: string | undefined;
+    for await (const ev of this.stream(params)) {
+      if (ev.type === "text") text += ev.delta;
+      else if (ev.type === "usage") usage = ev.usage;
+      else if (ev.type === "error") {
+        error = ev.message;
+        break;
+      }
+    }
+    return { text, usage, error };
   }
 
   /** Fetch the list of available models from OpenRouter. */

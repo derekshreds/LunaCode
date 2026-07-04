@@ -1,19 +1,48 @@
 import * as vscode from "vscode";
-import { OpenRouterClient } from "../openrouter/client";
+import { OpenRouterClient, isTransientFrame } from "../openrouter/client";
 import {
   AssistantMessage,
   ToolCall,
   Usage,
 } from "../openrouter/types";
 import { ContextManager } from "./contextManager";
+import { summarizeSpan } from "./summarizer";
 import {
   ApprovalDecision,
   ApprovalRequest,
   Tool,
   ToolContext,
 } from "./tools/types";
-import { toolByName, toolsForMode, toToolDefinitions } from "./tools";
+import { toolsForMode, toolsForSubagent, toToolDefinitions } from "./tools";
+import { formatFile, postEditDiagnostics } from "./tools/vscodeTools";
+import { runSubagent } from "./subagent";
 import { AgentMode, MODES } from "../modes";
+
+/** Tools whose success should trigger snapshot/format/diagnostics handling. */
+const EDIT_TOOLS = new Set(["write_file", "edit_file", "apply_patch"]);
+
+/** A tool call whose name arrived and whose JSON arguments parse — i.e. it
+ * streamed to completion and is safe to execute. */
+function isCompleteCall(c: ToolCall): boolean {
+  if (!c.function.name || !c.function.arguments) return false;
+  try {
+    JSON.parse(c.function.arguments);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Workspace-relative paths an edit-tool call touches. */
+function editPaths(toolName: string, args: any): string[] {
+  if (!EDIT_TOOLS.has(toolName)) return [];
+  if (toolName === "apply_patch") {
+    return Array.isArray(args?.changes)
+      ? args.changes.map((c: any) => c?.path).filter((p: any) => typeof p === "string")
+      : [];
+  }
+  return typeof args?.path === "string" ? [args.path] : [];
+}
 
 export type AgentEvent =
   | { type: "turn_start" }
@@ -26,9 +55,21 @@ export type AgentEvent =
       type: "usage";
       usage: Usage;
       cachedTokens: number;
+      /** Model that incurred this usage; defaults to the active session model. */
+      model?: string;
     }
+  | { type: "compaction"; tokensSaved: number; summarized: boolean; deduped: number }
+  | { type: "tasks"; tasks: TaskItem[] }
+  /** Live generation progress (throttled) — includes tool-call argument
+   * streaming, which otherwise produces no visible output. */
+  | { type: "stream_progress"; tokens: number }
+  /** Live tool output (stdout, explore lookups) for a running tool card. */
+  | { type: "tool_output"; id: string; delta: string }
   | { type: "error"; message: string }
   | { type: "turn_end"; stopReason: string };
+
+import type { TaskItem } from "../webview/protocol";
+export type { TaskItem };
 
 export interface AgentCallbacks {
   onEvent(e: AgentEvent): void;
@@ -44,6 +85,24 @@ export interface AgentDeps {
   maxTokens: number;
   temperature: number;
   maxContextTokens: number;
+  /** Model used to summarize history during compaction events. */
+  summarizerModel: string;
+  /** Fraction of the budget to compact down to when an event fires. */
+  compactionTargetRatio: number;
+  /** Model for the explore research sub-agent; "" = the session model. */
+  subagentModel: string;
+  /** Capture a file's pre-edit state for turn checkpoints (revert support). */
+  snapshotFile?: (relPath: string) => Promise<void>;
+  /** Additional dynamic tools (e.g. bridged MCP tools). */
+  extraTools?: Tool[];
+  /** Drain user messages typed mid-turn — injected as steering at the next
+   * loop iteration instead of waiting for the turn to finish. */
+  takeSteering?: () => Array<{ text: string; images?: string[] }>;
+  /** Format edited files with the workspace formatter after each edit. */
+  formatAfterEdit?: boolean;
+  /** Session budget check: returns {spent, limit} when the session cost has
+   * crossed the configured budget, else null. */
+  checkBudget?: () => { spent: number; limit: number } | null;
 }
 
 const MAX_TOOL_ITERATIONS = 50;
@@ -55,6 +114,13 @@ const MAX_TOOL_ITERATIONS = 50;
  */
 export class Agent {
   private abort?: AbortController;
+  /** Tools active for the current run (built-ins + dynamic), by name. */
+  private toolMap = new Map<string, Tool>();
+  /** User approved continuing past the session budget (for this run). */
+  private budgetApproved = false;
+  /** Streamed chars this turn (text + reasoning + tool args) for the counter. */
+  private streamedChars = 0;
+  private lastProgressAt = 0;
 
   constructor(private deps: AgentDeps, private cb: AgentCallbacks) {}
 
@@ -62,13 +128,34 @@ export class Agent {
     this.abort?.abort();
   }
 
-  async run(userText: string, mode: AgentMode): Promise<void> {
+  /** Throttled live-progress counter (covers silent tool-arg streaming). */
+  private trackProgress(chars: number) {
+    this.streamedChars += chars;
+    const now = Date.now();
+    if (now - this.lastProgressAt >= 250) {
+      this.lastProgressAt = now;
+      this.cb.onEvent({
+        type: "stream_progress",
+        tokens: Math.round(this.streamedChars / 4),
+      });
+    }
+  }
+
+  async run(userText: string, mode: AgentMode, images?: string[]): Promise<void> {
     this.abort = new AbortController();
     const signal = this.abort.signal;
-    this.deps.context.addUser(userText);
+    this.budgetApproved = false;
+    this.streamedChars = 0;
+    this.lastProgressAt = 0;
+    this.deps.context.addUser(userText, images);
     this.cb.onEvent({ type: "turn_start" });
 
-    const tools = toolsForMode(!MODES[mode].allowsMutation);
+    const allowsMutation = MODES[mode].allowsMutation;
+    const tools = [
+      ...toolsForMode(!allowsMutation),
+      ...(this.deps.extraTools ?? []).filter((t) => allowsMutation || !t.mutating),
+    ];
+    this.toolMap = new Map(tools.map((t) => [t.name, t]));
     const toolDefs = toToolDefinitions(tools);
 
     try {
@@ -78,16 +165,101 @@ export class Agent {
           return;
         }
 
-        // Keep within the context budget before each call.
-        if (this.deps.context.compactIfNeeded(this.deps.maxContextTokens)) {
-          this.cb.onEvent({ type: "status", message: "Compacted older context to fit budget." });
+        // Session budget guardrail: when the session's spend crosses the
+        // configured limit, pause and ask — even in Auto mode. "Approve always"
+        // silences it for the rest of the session (provider-side memory).
+        const over = this.deps.checkBudget?.();
+        if (over && !this.budgetApproved) {
+          const decision = await this.cb.requestApproval({
+            kind: "session-budget",
+            title: "Session budget reached",
+            subject: `$${over.spent.toFixed(2)} spent (limit $${over.limit.toFixed(2)})`,
+            detail: "Continue this session anyway? 'Always' silences this for the session.",
+          });
+          if (decision === "rejected") {
+            this.cb.onEvent({
+              type: "status",
+              message: "Stopped: session budget reached. Raise lunacode.sessionBudgetUsd or start a new session.",
+            });
+            this.cb.onEvent({ type: "turn_end", stopReason: "budget" });
+            return;
+          }
+          this.budgetApproved = true;
+        }
+
+        // Mid-turn steering: user messages typed while the agent works are
+        // injected here so they influence the CURRENT task immediately.
+        const steering = this.deps.takeSteering?.() ?? [];
+        for (const s of steering) {
+          this.deps.context.addUser(s.text, s.images);
+        }
+        if (steering.length) {
+          this.cb.onEvent({ type: "status", message: "Steering message applied to the running task." });
+        }
+
+        // Context-budget check. This mutates history only when the budget is
+        // exceeded (a rare "compaction event"); otherwise history stays
+        // append-only so the provider prompt cache keeps hitting.
+        const compaction = await this.deps.context.compactIfNeeded(
+          this.deps.maxContextTokens,
+          {
+            targetRatio: this.deps.compactionTargetRatio,
+            summarize: (span) =>
+              summarizeSpan(
+                this.deps.client,
+                this.deps.summarizerModel,
+                span,
+                signal,
+                (usage) =>
+                  this.cb.onEvent({
+                    type: "usage",
+                    usage,
+                    cachedTokens:
+                      usage.prompt_tokens_details?.cached_tokens ??
+                      usage.cache_read_input_tokens ??
+                      0,
+                    model: this.deps.summarizerModel,
+                  })
+              ),
+          }
+        );
+        if (compaction) {
+          this.cb.onEvent({ type: "compaction", ...compaction });
+          this.cb.onEvent({
+            type: "status",
+            message: compaction.summarized
+              ? `Compacted context into a checkpoint (~${Math.round(compaction.tokensSaved / 1000)}k tokens saved).`
+              : `Compacted older context to fit budget (summarizer unavailable — truncated instead).`,
+          });
         }
 
         const assistantMsg: AssistantMessage = { role: "assistant", content: "" };
         let textBuf = "";
         const toolCalls: Map<number, ToolCall> = new Map();
         let finishReason: string | null = null;
-        let errored = false;
+        let streamError: { message: string; transient: boolean } | null = null;
+        let servedModel: string | null = null;
+        // The live counter restarts for each thinking step (each model call).
+        this.streamedChars = 0;
+        this.lastProgressAt = 0;
+
+        // Eager execution: a READ-ONLY tool call whose JSON is complete starts
+        // running while the model is still streaming the rest of its message —
+        // overlapping generation with I/O. A call at index i is known-complete
+        // once a call at a higher index begins. Mutating tools never run early.
+        const eager = new Map<number, Promise<string>>();
+        const maybeStartEager = (idx: number) => {
+          const tc = toolCalls.get(idx);
+          if (!tc || !tc.function.name || eager.has(idx)) return;
+          const tool = this.toolMap.get(tc.function.name);
+          if (!tool || tool.mutating) return;
+          try {
+            if (tc.function.arguments) JSON.parse(tc.function.arguments);
+          } catch {
+            return; // incomplete/invalid JSON — leave for the normal path
+          }
+          eager.set(idx, this.runToolCall(tc, mode, signal, false));
+        };
 
         for await (const ev of this.deps.client.stream({
           messages: this.deps.context.render(),
@@ -97,11 +269,20 @@ export class Agent {
           signal,
         })) {
           switch (ev.type) {
+            case "model":
+              servedModel = ev.id;
+              this.cb.onEvent({
+                type: "status",
+                message: `Primary model unavailable — served by fallback ${ev.id}.`,
+              });
+              break;
             case "text":
               textBuf += ev.delta;
+              this.trackProgress(ev.delta.length);
               this.cb.onEvent({ type: "text", delta: ev.delta });
               break;
             case "reasoning":
+              this.trackProgress(ev.delta.length);
               this.cb.onEvent({ type: "reasoning", delta: ev.delta });
               break;
             case "tool_call_start": {
@@ -115,12 +296,19 @@ export class Agent {
                   type: "function",
                   function: { name: ev.name, arguments: "" },
                 });
+                // A new call starting means every lower-indexed call is done.
+                for (const idx of toolCalls.keys()) {
+                  if (idx < ev.index) maybeStartEager(idx);
+                }
               }
               break;
             }
             case "tool_call_delta": {
               const tc = toolCalls.get(ev.index);
               if (tc) tc.function.arguments += ev.argsDelta;
+              // Writing a big file streams entirely through tool args with no
+              // visible text — the counter is what shows it isn't hung.
+              this.trackProgress(ev.argsDelta.length);
               break;
             }
             case "usage":
@@ -131,24 +319,52 @@ export class Agent {
                   ev.usage.prompt_tokens_details?.cached_tokens ??
                   ev.usage.cache_read_input_tokens ??
                   0,
+                model: servedModel ?? undefined,
+              });
+              break;
+            case "retry":
+              this.cb.onEvent({
+                type: "status",
+                message: `${ev.reason} — retrying (attempt ${ev.attempt + 1} of ${ev.maxAttempts})…`,
               });
               break;
             case "done":
               finishReason = ev.finishReason;
               break;
             case "error":
-              this.cb.onEvent({ type: "error", message: ev.message });
-              errored = true;
+              streamError = {
+                message: ev.message,
+                transient: isTransientFrame(ev.message, ev.code),
+              };
               break;
           }
         }
 
-        if (errored) {
-          this.cb.onEvent({ type: "turn_end", stopReason: "error" });
-          return;
+        if (streamError) {
+          // Salvage a transiently-killed stream when at least one COMPLETE
+          // tool call arrived: drop the cut-off call, commit the rest, and
+          // let the loop continue — the model re-issues what was lost. The
+          // client already retried anything that died before content; this
+          // covers provider stalls after tool calls started streaming.
+          const completeCalls = [...toolCalls.values()].filter(isCompleteCall).length;
+          if (!streamError.transient || completeCalls === 0) {
+            this.cb.onEvent({ type: "error", message: streamError.message });
+            this.cb.onEvent({ type: "turn_end", stopReason: "error" });
+            return;
+          }
+          for (const [idx, c] of [...toolCalls.entries()]) {
+            if (!isCompleteCall(c)) toolCalls.delete(idx);
+          }
+          this.cb.onEvent({
+            type: "status",
+            message: `Provider stalled mid-turn (${streamError.message}) — continuing with ${completeCalls} completed tool call(s).`,
+          });
         }
 
-        const calls = [...toolCalls.values()].filter((c) => c.function.name);
+        const entries = [...toolCalls.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .filter(([, c]) => c.function.name);
+        const calls = entries.map(([, c]) => c);
         assistantMsg.content = textBuf.length ? textBuf : null;
         if (calls.length) assistantMsg.tool_calls = calls;
         this.deps.context.addAssistant(assistantMsg);
@@ -163,17 +379,55 @@ export class Agent {
         // message is actionable instead of a cryptic "invalid JSON".
         const truncated = finishReason === "length";
 
-        // Execute each tool call sequentially (edits/commands shouldn't race).
+        // Execute tool calls. Eagerly-started calls just get awaited; other
+        // consecutive read-only calls run CONCURRENTLY — the model pays a full
+        // context pass per round-trip, so ten batched reads must cost one pass,
+        // not ten sequential ones. Mutating calls (edits/commands) never race.
         // Every tool_call MUST get a matching tool result or the next request
         // will be rejected — so on abort we backfill the remaining calls.
-        for (let i = 0; i < calls.length; i++) {
+        let i = 0;
+        while (i < entries.length) {
           if (signal.aborted) {
-            for (let j = i; j < calls.length; j++) {
-              this.deps.context.addToolResult(calls[j].id, "Cancelled by user.");
+            for (let j = i; j < entries.length; j++) {
+              const [idx, call] = entries[j];
+              const pending = eager.get(idx);
+              this.deps.context.addToolResult(
+                call.id,
+                pending ? await pending : "Cancelled by user."
+              );
             }
             break;
           }
-          await this.executeToolCall(calls[i], mode, signal, truncated);
+          const [idx, call] = entries[i];
+          const pending = eager.get(idx);
+          if (pending) {
+            this.deps.context.addToolResult(call.id, await pending);
+            i++;
+            continue;
+          }
+          const tool = this.toolMap.get(call.function.name);
+          if (tool && !tool.mutating) {
+            // Maximal run of consecutive non-eager read-only calls → parallel.
+            let j = i + 1;
+            while (j < entries.length && !eager.has(entries[j][0])) {
+              const t = this.toolMap.get(entries[j][1].function.name);
+              if (t && !t.mutating) j++;
+              else break;
+            }
+            const batch = entries.slice(i, j).map(([, c]) => c);
+            const results = await Promise.all(
+              batch.map((c) => this.runToolCall(c, mode, signal, truncated))
+            );
+            // Append results in call order regardless of completion order.
+            for (let k = 0; k < batch.length; k++) {
+              this.deps.context.addToolResult(batch[k].id, results[k]);
+            }
+            i = j;
+          } else {
+            const result = await this.runToolCall(call, mode, signal, truncated);
+            this.deps.context.addToolResult(call.id, result);
+            i++;
+          }
         }
       }
       this.cb.onEvent({
@@ -187,13 +441,18 @@ export class Agent {
     }
   }
 
-  private async executeToolCall(
+  /**
+   * Run one tool call end-to-end (UI events included) and RETURN the result
+   * content — the caller appends it to the context, so parallel batches can
+   * append results in call order regardless of completion order.
+   */
+  private async runToolCall(
     call: ToolCall,
     mode: AgentMode,
     signal: AbortSignal,
     truncated = false
-  ): Promise<void> {
-    const tool = toolByName(call.function.name);
+  ): Promise<string> {
+    const tool = this.toolMap.get(call.function.name);
     let args: any = {};
     let parseFailed = false;
     try {
@@ -210,7 +469,6 @@ export class Agent {
       const msg = truncated
         ? `The tool call was cut off at the output-token limit, so its arguments are incomplete. Increase "lunacode.maxTokens", or write/edit the file in smaller pieces (e.g. create it then append with edit_file).`
         : `Invalid JSON arguments for ${call.function.name}. Re-issue the call with valid JSON.`;
-      this.deps.context.addToolResult(call.id, msg);
       this.cb.onEvent({
         type: "tool_end",
         id: call.id,
@@ -218,22 +476,20 @@ export class Agent {
         ok: false,
         summary: msg,
       });
-      return;
+      return msg;
     }
 
     if (!tool) {
       const msg = `Unknown tool: ${call.function.name}`;
-      this.deps.context.addToolResult(call.id, msg);
       this.cb.onEvent({ type: "tool_end", id: call.id, name: call.function.name, ok: false, summary: msg });
-      return;
+      return msg;
     }
 
     // Plan mode: refuse mutating tools (also filtered from the tool list).
     if (tool.mutating && !MODES[mode].allowsMutation) {
       const msg = `Blocked: ${tool.name} cannot run in Plan mode. Propose the change instead.`;
-      this.deps.context.addToolResult(call.id, msg);
       this.cb.onEvent({ type: "tool_end", id: call.id, name: tool.name, ok: false, summary: msg });
-      return;
+      return msg;
     }
 
     const ctx: ToolContext = {
@@ -242,6 +498,8 @@ export class Agent {
       signal,
       output: this.deps.output,
       log: (m) => this.cb.onEvent({ type: "status", message: m }),
+      emitOutput: (delta) =>
+        this.cb.onEvent({ type: "tool_output", id: call.id, delta }),
       requestApproval: async (req) => {
         // Auto mode is fully autonomous: it runs edits AND commands without
         // prompting. (Always-deny commands are still hard-blocked inside
@@ -253,11 +511,65 @@ export class Agent {
         // approved-always -> approved.
         return this.cb.requestApproval(req);
       },
+      explore: (question) =>
+        runSubagent(question, {
+          client: this.deps.client,
+          model: this.deps.subagentModel || undefined,
+          tools: toolsForSubagent(),
+          workspaceRoot: this.deps.workspaceRoot,
+          output: this.deps.output,
+          signal,
+          // Sub-agent progress streams into the explore call's own card.
+          onStatus: (m) =>
+            this.cb.onEvent({ type: "tool_output", id: call.id, delta: m + "\n" }),
+          onUsage: (usage) =>
+            this.cb.onEvent({
+              type: "usage",
+              usage,
+              cachedTokens:
+                usage.prompt_tokens_details?.cached_tokens ??
+                usage.cache_read_input_tokens ??
+                0,
+              model: this.deps.subagentModel || undefined,
+            }),
+        }),
     };
 
     try {
+      // Checkpoint each file's before-state so the user can revert this turn.
+      const paths = editPaths(tool.name, args);
+      if (this.deps.snapshotFile) {
+        for (const p of paths) await this.deps.snapshotFile(p);
+      }
       const result = await tool.execute(args, ctx);
-      this.deps.context.addToolResult(call.id, result.content);
+      // Task checklist: mirror successful set_tasks calls to the UI.
+      if (tool.name === "set_tasks" && !result.isError && Array.isArray(args?.tasks)) {
+        this.cb.onEvent({
+          type: "tasks",
+          tasks: args.tasks
+            .filter((t: any) => t && typeof t.label === "string")
+            .map((t: any) => ({
+              label: t.label,
+              status: t.status === "done" ? "done" : t.status === "active" ? "active" : "pending",
+            })),
+        });
+      }
+      let content = result.content;
+      if (!result.isError && paths.length) {
+        // Optional: match project style before checking diagnostics.
+        if (this.deps.formatAfterEdit) {
+          for (const p of paths.slice(0, 5)) {
+            await formatFile(this.deps.workspaceRoot, p);
+          }
+        }
+        // Auto-verify: surface fresh language-server diagnostics for the edited
+        // files in the SAME tool result — saves the model a whole round-trip
+        // (a full context pass) discovering its own type errors.
+        for (const p of paths.slice(0, 3)) {
+          const diag = await postEditDiagnostics(this.deps.workspaceRoot, p, signal);
+          if (diag) content += `\n\n${diag}`;
+        }
+      }
       const diff = result.ui?.diff as import("../webview/protocol").DiffData | undefined;
       this.cb.onEvent({
         type: "tool_end",
@@ -267,10 +579,11 @@ export class Agent {
         summary: firstLine(result.content),
         diff,
       });
+      return content;
     } catch (e: any) {
       const msg = `Tool ${tool.name} threw: ${e?.message ?? e}`;
-      this.deps.context.addToolResult(call.id, msg);
       this.cb.onEvent({ type: "tool_end", id: call.id, name: tool.name, ok: false, summary: msg });
+      return msg;
     }
   }
 }

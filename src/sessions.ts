@@ -15,6 +15,9 @@ export interface StoredSession extends SessionMeta {
   mode: AgentMode;
   messages: ChatMessage[];
   usage?: SessionUsage;
+  /** Per-turn file checkpoints for revert (path → before-content, null = new
+   * file). Optional; large entries are trimmed before persisting. */
+  checkpoints?: Array<Array<[string, string | null]>>;
 }
 
 const INDEX_KEY = "lunacode.sessions.index";

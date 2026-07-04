@@ -16,6 +16,8 @@ export interface ApprovalRequest {
   detail?: string;
   /** Optional structured diff preview (for edits/writes). */
   diff?: DiffData;
+  /** Multi-file patches: one diff per file. */
+  diffs?: DiffData[];
 }
 
 /** Everything a tool needs to do its job. */
@@ -30,6 +32,17 @@ export interface ToolContext {
   signal: AbortSignal;
   /** Output channel for verbose diagnostics. */
   output: vscode.OutputChannel;
+  /**
+   * Run a research question through a disposable sub-agent and return its
+   * digest. Injected by the main Agent only — absent inside sub-agents, so
+   * explore can never recurse.
+   */
+  explore?(question: string): Promise<string>;
+  /**
+   * Stream live output (stdout, sub-agent progress) to this call's card in
+   * the UI while the tool runs. Display-only — never part of the tool result.
+   */
+  emitOutput?(delta: string): void;
 }
 
 export interface ToolResult {

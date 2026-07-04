@@ -34,30 +34,123 @@ function checkInvariants(msgs: ChatMessage[], label: string) {
   }
 }
 
-console.log("ContextManager compaction:");
-{
-  const cm = new ContextManager(true);
-  cm.setSystemPrompt("SYS");
-  // Build a long history: user, then many assistant(tool_calls)+tool exchanges.
+/** Long history: user, then many assistant(tool_calls)+tool exchanges. Distinct
+ * args per call unless `sameArgs` — dedupe should only fire on identical calls. */
+function buildHistory(cm: ContextManager, n: number, sameArgs = false) {
   cm.addUser("initial request");
-  for (let i = 0; i < 40; i++) {
+  for (let i = 0; i < n; i++) {
     const id = `call_${i}`;
+    const args = sameArgs ? `{"path":"a.ts"}` : `{"path":"file_${i}.ts"}`;
     cm.addAssistant({
       role: "assistant",
       content: null,
-      tool_calls: [{ id, type: "function", function: { name: "read_file", arguments: "{}" } }],
+      tool_calls: [{ id, type: "function", function: { name: "read_file", arguments: args } }],
     });
     cm.addToolResult(id, "X".repeat(2000)); // big result to blow the budget
   }
   cm.addUser("final question");
+}
 
-  const before = cm.estimate();
-  const didCompact = cm.compactIfNeeded(3000);
-  const after = cm.estimate();
-  assert(didCompact, "compaction ran");
-  assert(after < before, `tokens reduced (${before} -> ${after})`);
-  assert(after <= 3000 || cm.getMessages().length <= 4, "within budget or floored");
-  checkInvariants([{ role: "system", content: "SYS" }, ...cm.getMessages()], "compacted");
+async function compactionTests() {
+  console.log("Compaction (legacy fallback — no summarizer):");
+  {
+    const cm = new ContextManager(true);
+    cm.setSystemPrompt("SYS");
+    buildHistory(cm, 40);
+    const before = cm.estimate();
+    const result = await cm.compactIfNeeded(3000, { targetRatio: 0.45 });
+    const after = cm.estimate();
+    assert(result !== null, "compaction ran");
+    assert(after < before, `tokens reduced (${before} -> ${after})`);
+    assert(after <= 3000 || cm.getMessages().length <= 4, "within budget or floored");
+    assert(!result!.summarized, "fell back to truncation without a summarizer");
+    const msgs = cm.getMessages();
+    const last = msgs[msgs.length - 1];
+    assert(last.role === "user" && last.content === "final question", "active task preserved");
+    checkInvariants([{ role: "system", content: "SYS" }, ...msgs], "compacted");
+  }
+
+  console.log("Compaction (summarizer checkpoint):");
+  {
+    const cm = new ContextManager(true);
+    cm.setSystemPrompt("SYS");
+    buildHistory(cm, 40);
+    const result = await cm.compactIfNeeded(3000, {
+      targetRatio: 0.45,
+      summarize: async () => ({ text: "Goal: test\nNext step: continue" }),
+    });
+    assert(result !== null && result.summarized, "summarize path taken");
+    const msgs = cm.getMessages();
+    const checkpoints = msgs.filter(
+      (m) =>
+        m.role === "assistant" &&
+        typeof m.content === "string" &&
+        m.content.startsWith("[Luna Code checkpoint")
+    );
+    assert(checkpoints.length === 1, "exactly one checkpoint message inserted");
+    assert(cm.estimate() <= 3000, `driven under budget (${cm.estimate()})`);
+    const last = msgs[msgs.length - 1];
+    assert(last.role === "user" && last.content === "final question", "active task preserved");
+    checkInvariants([{ role: "system", content: "SYS" }, ...msgs], "summarized");
+  }
+
+  console.log("Dedupe of repeated identical tool calls:");
+  {
+    const cm = new ContextManager(true);
+    cm.setSystemPrompt("SYS");
+    buildHistory(cm, 40, /* sameArgs */ true); // 40 reads of the SAME file
+    const result = await cm.compactIfNeeded(3000, {
+      targetRatio: 0.45,
+      summarize: async () => ({ text: "Goal: test" }),
+    });
+    assert(result !== null && result.deduped > 0, `stale duplicates stubbed (${result?.deduped})`);
+    // The newest surviving duplicate (if still in history) must not be a stub.
+    const tools = cm.getMessages().filter((m) => m.role === "tool");
+    const lastTool = tools[tools.length - 1];
+    if (lastTool && typeof lastTool.content === "string") {
+      assert(!lastTool.content.startsWith("[superseded:"), "latest result kept intact");
+    }
+    checkInvariants([{ role: "system", content: "SYS" }, ...cm.getMessages()], "deduped");
+  }
+
+  console.log("Anchor breakpoints & rollback:");
+  {
+    const cm = new ContextManager(true);
+    cm.setSystemPrompt("SYS");
+    cm.addUser("start");
+    for (let i = 0; i < 40; i++) {
+      cm.addAssistant({ role: "assistant", content: `step ${i}` });
+    }
+    const rendered = cm.render();
+    const bps = rendered.filter(
+      (m) =>
+        Array.isArray((m as any).content) &&
+        (m as any).content.some((p: any) => p.cache_control)
+    ).length;
+    assert(bps >= 3 && bps <= 4, `system + anchors + rolling breakpoints present (${bps})`);
+
+    cm.addUser("question two");
+    cm.addAssistant({ role: "assistant", content: "answer two" });
+    const rolled = cm.rollbackToLastUser();
+    assert(rolled?.text === "question two", "rollback returns the last user text");
+    const msgs = cm.getMessages();
+    const last = msgs[msgs.length - 1];
+    assert(
+      last.role === "assistant" && last.content === "step 39",
+      "history truncated to before the last user turn"
+    );
+  }
+
+  console.log("Append-only below budget:");
+  {
+    const cm = new ContextManager(true);
+    cm.setSystemPrompt("SYS");
+    buildHistory(cm, 3);
+    const snapshot = JSON.stringify(cm.getMessages());
+    const result = await cm.compactIfNeeded(1_000_000, { targetRatio: 0.45 });
+    assert(result === null, "no compaction under budget");
+    assert(JSON.stringify(cm.getMessages()) === snapshot, "history untouched (cache prefix stable)");
+  }
 }
 
 console.log("Cache breakpoint placement:");
@@ -94,9 +187,16 @@ console.log("No-caching mode:");
   assert(typeof rendered[0].content === "string", "system is plain string when caching disabled");
 }
 
-if (failures) {
-  console.error(`\n${failures} assertion(s) failed.`);
-  process.exit(1);
-} else {
-  console.log("\nAll context invariants hold. ✓");
-}
+compactionTests()
+  .then(() => {
+    if (failures) {
+      console.error(`\n${failures} assertion(s) failed.`);
+      process.exit(1);
+    } else {
+      console.log("\nAll context invariants hold. ✓");
+    }
+  })
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });

@@ -2,7 +2,7 @@
   "name": "lunacode",
   "displayName": "Luna Code — AI Coding Agent",
   "description": "An agentic coding assistant powered by OpenRouter. Configure with just an API key and a model.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "derekshreds",
   "license": "MIT",
   "repository": {
@@ -111,6 +111,34 @@
       {
         "command": "lunacode.addSelectionToChat",
         "title": "Luna Code: Add Selection to Chat"
+      },
+      {
+        "command": "lunacode.fixFile",
+        "title": "Luna Code: Fix Problems in This File"
+      },
+      {
+        "command": "lunacode.refactorSelection",
+        "title": "Luna Code: Refactor Selection…"
+      },
+      {
+        "command": "lunacode.explainSelection",
+        "title": "Luna Code: Explain Selection"
+      },
+      {
+        "command": "lunacode.mergeSandbox",
+        "title": "Luna Code: Merge Sandbox Changes"
+      },
+      {
+        "command": "lunacode.discardSandbox",
+        "title": "Luna Code: Discard Sandbox"
+      },
+      {
+        "command": "lunacode.exportSession",
+        "title": "Luna Code: Export Session as Markdown"
+      },
+      {
+        "command": "lunacode.selectWorkspaceFolder",
+        "title": "Luna Code: Select Working Folder (Multi-root)"
       }
     ],
     "menus": {
@@ -136,6 +164,21 @@
           "command": "lunacode.addSelectionToChat",
           "when": "editorHasSelection",
           "group": "lunacode@1"
+        },
+        {
+          "command": "lunacode.refactorSelection",
+          "when": "editorHasSelection",
+          "group": "lunacode@2"
+        },
+        {
+          "command": "lunacode.explainSelection",
+          "when": "editorHasSelection",
+          "group": "lunacode@3"
+        },
+        {
+          "command": "lunacode.fixFile",
+          "when": "editorTextFocus",
+          "group": "lunacode@4"
         }
       ]
     },
@@ -210,10 +253,97 @@
           "default": false,
           "description": "Stricter than dataCollection: only route to Zero-Data-Retention (ZDR) endpoints. May reduce the set of available providers and occasionally cause routing failures if no ZDR endpoint exists for the model."
         },
+        "lunacode.providerSort": {
+          "type": "string",
+          "enum": ["throughput", "latency", "price", "default"],
+          "enumDescriptions": [
+            "Throughput — prefer the fastest-generating provider. Fewer 'Upstream idle timeout' stalls on big contexts, but may route to pricier endpoints.",
+            "Latency — prefer the provider with the lowest time-to-first-token.",
+            "Price — prefer the cheapest provider.",
+            "Default — OpenRouter's load-balanced routing."
+          ],
+          "default": "throughput",
+          "description": "How OpenRouter picks among providers serving the model. Throughput/latency reduce provider stalls (upstream idle timeouts) at potentially higher cost per token."
+        },
         "lunacode.maxContextTokens": {
           "type": "number",
-          "default": 180000,
-          "description": "Approximate token budget for the conversation before older turns are summarized/compacted."
+          "default": 0,
+          "description": "Context-budget trigger: when the conversation exceeds this many tokens, a compaction event summarizes older turns down to the floor (see compactionTargetRatio). 0 (recommended) sizes the budget automatically from the active model's context window AND its price, so a fully-cached turn stays under autoBudgetCarryCostUsd. Set a positive number to pin the budget manually."
+        },
+        "lunacode.autoBudgetCarryCostUsd": {
+          "type": "number",
+          "default": 0.1,
+          "minimum": 0.01,
+          "maximum": 2,
+          "description": "Auto-budget target for the cost (USD) of one fully-cached context pass. Every API call re-reads the whole context (~0.1× input price when cached), so this caps the per-call carry cost on expensive models: at $0.10, a $10/M model is budgeted ~100K tokens while cheap models get their full window. Only used when maxContextTokens is 0."
+        },
+        "lunacode.compactionTargetRatio": {
+          "type": "number",
+          "default": 0.45,
+          "minimum": 0.2,
+          "maximum": 0.8,
+          "description": "When a compaction event fires, the context is reduced to this fraction of the budget. Lower = rarer compactions (better prompt-cache economics) but more history summarized away."
+        },
+        "lunacode.summarizerModel": {
+          "type": "string",
+          "default": "",
+          "description": "OpenRouter model id used to summarize older history into a checkpoint during compaction (a cheap model like deepseek/deepseek-v4-flash is ideal). Empty = use the active session model. If the summarizer call fails, Luna Code falls back to plain truncation."
+        },
+        "lunacode.subagentModel": {
+          "type": "string",
+          "default": "",
+          "description": "OpenRouter model id for the explore research sub-agent (investigates the codebase in a separate context and returns a digest). A fast, cheap model works well here. Empty = use the active session model."
+        },
+        "lunacode.sessionBudgetUsd": {
+          "type": "number",
+          "default": 0,
+          "description": "Session spending limit in USD. When a session's total cost crosses this, Luna Code pauses and asks before continuing (even in Auto mode). 0 disables the guardrail."
+        },
+        "lunacode.includeActiveFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Attach the active editor's file path (and selection, if any) to each message you send, so the agent knows what you're looking at."
+        },
+        "lunacode.formatAfterEdit": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run the workspace's document formatter on files right after the agent edits them, so its changes match project style."
+        },
+        "lunacode.worktreeMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Sandbox mode: the agent works in a separate git worktree instead of your working tree. Review with the ± chip, then use 'Luna Code: Merge Sandbox Changes' to apply them to your real tree, or 'Discard Sandbox'. Note: dependencies (node_modules etc.) are not installed in the worktree."
+        },
+        "lunacode.customCommands": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": { "type": "string" },
+          "markdownDescription": "Custom slash commands: `{ \"deploy\": \"Run the deploy checklist: ...\" }` makes `/deploy` expand to that prompt (any text after the command is appended). Built-ins: `/commit`, `/review`, `/tests`."
+        },
+        "lunacode.fallbackModels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Models to fall back to (in order) when the primary model errors or is rate-limited, via OpenRouter's models routing. A status line notes when a fallback served the response."
+        },
+        "lunacode.prewarmCache": {
+          "type": "boolean",
+          "default": false,
+          "description": "Pre-warm the provider prompt cache when a session opens by sending a tiny request, so your first real message starts from a warm (cheap, fast) cache. Costs one small cache write you would have paid on the first message anyway."
+        },
+        "lunacode.mcpServers": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "MCP servers to connect via stdio. Each key is a server name mapping to `{ \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"], \"env\": { \"GITHUB_TOKEN\": \"…\" } }`. Their tools are exposed to the agent as `mcp__<server>__<tool>` and require approval in Standard mode.",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["command"],
+            "properties": {
+              "command": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "env": { "type": "object", "additionalProperties": { "type": "string" } }
+            }
+          }
         },
         "lunacode.autoApproveCommands": {
           "type": "array",

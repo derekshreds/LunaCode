@@ -24,6 +24,13 @@ export function activate(context: vscode.ExtensionContext) {
   const provider = new LunaCodeViewProvider(controller, context.extensionUri);
 
   context.subscriptions.push(
+    // Shut down MCP server processes on deactivate.
+    { dispose: () => controller.dispose() },
+    // Keep the webview (model chip + open settings sheet) in sync with edits
+    // made outside it — the model QuickPick or VS Code's settings editor.
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("lunacode")) controller.onConfigChanged();
+    }),
     // Primary sidebar (Activity Bar) surface.
     vscode.window.registerWebviewViewProvider(
       LunaCodeViewProvider.viewType,
@@ -96,7 +103,98 @@ export function activate(context: vscode.ExtensionContext) {
       const file = vscode.workspace.asRelativePath(editor.document.uri);
       await vscode.commands.executeCommand("lunacode.chatView.focus");
       controller.addSelection(text, file, editor.selection.start.line + 1);
-    })
+    }),
+
+    // --- editor-native entry points ---
+
+    vscode.commands.registerCommand("lunacode.fixFile", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor) return;
+      const rel = vscode.workspace.asRelativePath(editor.document.uri);
+      const diags = vscode.languages
+        .getDiagnostics(editor.document.uri)
+        .filter((d) => d.severity <= vscode.DiagnosticSeverity.Warning)
+        .slice(0, 30)
+        .map((d) => `${rel}:${d.range.start.line + 1} ${d.message}`);
+      if (!diags.length) {
+        vscode.window.showInformationMessage(`Luna Code: no problems reported in ${rel}.`);
+        return;
+      }
+      await controller.sendExternal(
+        `Fix these problems in ${rel}:\n${diags.join("\n")}`
+      );
+    }),
+
+    vscode.commands.registerCommand("lunacode.refactorSelection", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.selection.isEmpty) return;
+      const instruction = await vscode.window.showInputBox({
+        title: "Refactor selection",
+        prompt: "What should Luna do with the selected code?",
+        placeHolder: "e.g. extract this into a helper function",
+        ignoreFocusOut: true,
+      });
+      if (!instruction?.trim()) return;
+      const rel = vscode.workspace.asRelativePath(editor.document.uri);
+      const sel = editor.selection;
+      const text = editor.document.getText(sel).slice(0, 6000);
+      await controller.sendExternal(
+        `${instruction.trim()}\n\nThe code in question (${rel}, lines ${sel.start.line + 1}-${sel.end.line + 1}):\n\`\`\`\n${text}\n\`\`\``
+      );
+    }),
+
+    vscode.commands.registerCommand("lunacode.explainSelection", async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.selection.isEmpty) return;
+      const rel = vscode.workspace.asRelativePath(editor.document.uri);
+      const sel = editor.selection;
+      const text = editor.document.getText(sel).slice(0, 6000);
+      await controller.sendExternal(
+        `Explain what this code does and any pitfalls (${rel}, lines ${sel.start.line + 1}-${sel.end.line + 1}):\n\`\`\`\n${text}\n\`\`\``
+      );
+    }),
+
+    vscode.commands.registerCommand("lunacode.mergeSandbox", () => controller.mergeSandbox()),
+    vscode.commands.registerCommand("lunacode.discardSandbox", () => controller.discardSandbox()),
+    vscode.commands.registerCommand("lunacode.exportSession", () => controller.exportSession()),
+    vscode.commands.registerCommand("lunacode.selectWorkspaceFolder", () =>
+      controller.pickWorkspaceFolder()
+    ),
+
+    // Quick-fix lightbulb: "Fix with Luna Code" on any diagnostic.
+    vscode.languages.registerCodeActionsProvider(
+      { scheme: "file" },
+      {
+        provideCodeActions(document, range, ctx) {
+          const relevant = ctx.diagnostics.filter(
+            (d) => d.severity <= vscode.DiagnosticSeverity.Warning
+          );
+          if (!relevant.length) return [];
+          const action = new vscode.CodeAction(
+            "Fix with Luna Code",
+            vscode.CodeActionKind.QuickFix
+          );
+          action.command = {
+            command: "lunacode.fixDiagnosticAt",
+            title: "Fix with Luna Code",
+            arguments: [document.uri, relevant.map((d) => ({
+              line: d.range.start.line + 1,
+              message: d.message,
+            }))],
+          };
+          return [action];
+        },
+      },
+      { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }
+    ),
+    vscode.commands.registerCommand(
+      "lunacode.fixDiagnosticAt",
+      async (uri: vscode.Uri, diags: Array<{ line: number; message: string }>) => {
+        const rel = vscode.workspace.asRelativePath(uri);
+        const list = diags.map((d) => `${rel}:${d.line} ${d.message}`).join("\n");
+        await controller.sendExternal(`Fix this problem:\n${list}`);
+      }
+    )
   );
 
   context.subscriptions.push(
