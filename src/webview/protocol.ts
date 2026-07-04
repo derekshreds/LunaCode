@@ -117,6 +117,7 @@ export interface SettingsPayload {
   defaultMode: AgentMode;
   dataCollection: "deny" | "allow";
   zeroDataRetention: boolean;
+  providerSort: "throughput" | "latency" | "price" | "default";
   sessionBudgetUsd: number;
   includeActiveFile: boolean;
   formatAfterEdit: boolean;

@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { OpenRouterClient } from "../openrouter/client";
+import { OpenRouterClient, isTransientFrame } from "../openrouter/client";
 import {
   AssistantMessage,
   ToolCall,
@@ -20,6 +20,18 @@ import { AgentMode, MODES } from "../modes";
 
 /** Tools whose success should trigger snapshot/format/diagnostics handling. */
 const EDIT_TOOLS = new Set(["write_file", "edit_file", "apply_patch"]);
+
+/** A tool call whose name arrived and whose JSON arguments parse — i.e. it
+ * streamed to completion and is safe to execute. */
+function isCompleteCall(c: ToolCall): boolean {
+  if (!c.function.name || !c.function.arguments) return false;
+  try {
+    JSON.parse(c.function.arguments);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Workspace-relative paths an edit-tool call touches. */
 function editPaths(toolName: string, args: any): string[] {
@@ -225,7 +237,7 @@ export class Agent {
         let textBuf = "";
         const toolCalls: Map<number, ToolCall> = new Map();
         let finishReason: string | null = null;
-        let errored = false;
+        let streamError: { message: string; transient: boolean } | null = null;
         let servedModel: string | null = null;
         // The live counter restarts for each thinking step (each model call).
         this.streamedChars = 0;
@@ -310,19 +322,43 @@ export class Agent {
                 model: servedModel ?? undefined,
               });
               break;
+            case "retry":
+              this.cb.onEvent({
+                type: "status",
+                message: `${ev.reason} — retrying (attempt ${ev.attempt + 1} of ${ev.maxAttempts})…`,
+              });
+              break;
             case "done":
               finishReason = ev.finishReason;
               break;
             case "error":
-              this.cb.onEvent({ type: "error", message: ev.message });
-              errored = true;
+              streamError = {
+                message: ev.message,
+                transient: isTransientFrame(ev.message, ev.code),
+              };
               break;
           }
         }
 
-        if (errored) {
-          this.cb.onEvent({ type: "turn_end", stopReason: "error" });
-          return;
+        if (streamError) {
+          // Salvage a transiently-killed stream when at least one COMPLETE
+          // tool call arrived: drop the cut-off call, commit the rest, and
+          // let the loop continue — the model re-issues what was lost. The
+          // client already retried anything that died before content; this
+          // covers provider stalls after tool calls started streaming.
+          const completeCalls = [...toolCalls.values()].filter(isCompleteCall).length;
+          if (!streamError.transient || completeCalls === 0) {
+            this.cb.onEvent({ type: "error", message: streamError.message });
+            this.cb.onEvent({ type: "turn_end", stopReason: "error" });
+            return;
+          }
+          for (const [idx, c] of [...toolCalls.entries()]) {
+            if (!isCompleteCall(c)) toolCalls.delete(idx);
+          }
+          this.cb.onEvent({
+            type: "status",
+            message: `Provider stalled mid-turn (${streamError.message}) — continuing with ${completeCalls} completed tool call(s).`,
+          });
         }
 
         const entries = [...toolCalls.entries()]

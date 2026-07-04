@@ -2,7 +2,7 @@
   "name": "lunacode",
   "displayName": "Luna Code — AI Coding Agent",
   "description": "An agentic coding assistant powered by OpenRouter. Configure with just an API key and a model.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "derekshreds",
   "license": "MIT",
   "repository": {
@@ -252,6 +252,18 @@
           "type": "boolean",
           "default": false,
           "description": "Stricter than dataCollection: only route to Zero-Data-Retention (ZDR) endpoints. May reduce the set of available providers and occasionally cause routing failures if no ZDR endpoint exists for the model."
+        },
+        "lunacode.providerSort": {
+          "type": "string",
+          "enum": ["throughput", "latency", "price", "default"],
+          "enumDescriptions": [
+            "Throughput — prefer the fastest-generating provider. Fewer 'Upstream idle timeout' stalls on big contexts, but may route to pricier endpoints.",
+            "Latency — prefer the provider with the lowest time-to-first-token.",
+            "Price — prefer the cheapest provider.",
+            "Default — OpenRouter's load-balanced routing."
+          ],
+          "default": "throughput",
+          "description": "How OpenRouter picks among providers serving the model. Throughput/latency reduce provider stalls (upstream idle timeouts) at potentially higher cost per token."
         },
         "lunacode.maxContextTokens": {
           "type": "number",

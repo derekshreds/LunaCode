@@ -27,6 +27,8 @@ export interface LunaCodeConfig {
   alwaysDenyCommands: string[];
   dataCollection: "deny" | "allow";
   zeroDataRetention: boolean;
+  /** OpenRouter provider ranking; undefined = OpenRouter's default load balancing. */
+  providerSort?: "throughput" | "latency" | "price";
   mcpServers: Record<string, McpServerConfig>;
 }
 
@@ -56,12 +58,17 @@ export function getConfig(): LunaCodeConfig {
     alwaysDenyCommands: c.get<string[]>("alwaysDenyCommands", []),
     dataCollection: c.get<string>("dataCollection", "deny") === "allow" ? "allow" : "deny",
     zeroDataRetention: c.get<boolean>("zeroDataRetention", false),
+    providerSort: parseProviderSort(c.get<string>("providerSort", "throughput")),
     mcpServers: c.get<Record<string, McpServerConfig>>("mcpServers", {}) ?? {},
   };
 }
 
 function clamp(n: number, lo: number, hi: number, fallback: number): number {
   return Math.min(hi, Math.max(lo, Number.isFinite(n) ? n : fallback));
+}
+
+function parseProviderSort(v: string): "throughput" | "latency" | "price" | undefined {
+  return v === "throughput" || v === "latency" || v === "price" ? v : undefined;
 }
 
 export async function setModel(model: string): Promise<void> {

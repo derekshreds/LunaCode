@@ -1375,6 +1375,18 @@ function showSettings(s: SettingsPayload) {
       toggleSetting("zeroDataRetention", s.zeroDataRetention)
     )
   );
+  priv.appendChild(
+    setRow(
+      "Provider sort",
+      "Throughput/latency avoid slow providers (fewer upstream idle timeouts) but may cost more per token.",
+      selectSetting("providerSort", s.providerSort, [
+        { value: "throughput", label: "Throughput — fastest generation (recommended)" },
+        { value: "latency", label: "Latency — fastest first token" },
+        { value: "price", label: "Price — cheapest provider" },
+        { value: "default", label: "Default — load-balanced" },
+      ])
+    )
+  );
   body.appendChild(priv);
 
   // --- Commands ---

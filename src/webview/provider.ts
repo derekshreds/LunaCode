@@ -73,7 +73,8 @@ export class LunaCodeController {
   private activeModel = "";
   /** Model metadata (context window + prompt price) for auto context budgets. */
   private modelMeta = new Map<string, { contextLength?: number; promptPrice?: number }>();
-  private modelMetaLoading = false;
+  private modelMetaPromise: Promise<void> | null = null;
+  private modelMetaFetchedAt = 0;
 
   /** Per-turn file checkpoints (before-contents; null = file didn't exist).
    * In-memory stack, newest last — revert pops. */
@@ -278,7 +279,7 @@ export class LunaCodeController {
         await this.commitLastTurn();
         break;
       case "getContextInfo":
-        this.sendContextInfo();
+        void this.sendContextInfo();
         break;
       case "retryTurn":
         await this.retryLastTurn(false);
@@ -314,6 +315,7 @@ export class LunaCodeController {
         defaultMode: cfg.defaultMode,
         dataCollection: cfg.dataCollection,
         zeroDataRetention: cfg.zeroDataRetention,
+        providerSort: cfg.providerSort ?? "default",
         sessionBudgetUsd: cfg.sessionBudgetUsd,
         includeActiveFile: cfg.includeActiveFile,
         formatAfterEdit: cfg.formatAfterEdit,
@@ -348,6 +350,7 @@ export class LunaCodeController {
     "defaultMode",
     "dataCollection",
     "zeroDataRetention",
+    "providerSort",
     "autoApproveCommands",
     "alwaysDenyCommands",
     "baseUrl",
@@ -691,6 +694,7 @@ export class LunaCodeController {
       model: cfg.model,
       dataCollection: cfg.dataCollection,
       zdr: cfg.zeroDataRetention,
+      providerSort: cfg.providerSort,
     });
 
     this.agent = new Agent(
@@ -701,7 +705,7 @@ export class LunaCodeController {
         workspaceRoot: root,
         maxTokens: cfg.maxTokens,
         temperature: cfg.temperature,
-        maxContextTokens: this.effectiveContextBudget(cfg, client),
+        maxContextTokens: await this.effectiveContextBudget(cfg, client),
         summarizerModel: cfg.summarizerModel || cfg.model,
         compactionTargetRatio: cfg.compactionTargetRatio,
         subagentModel: cfg.subagentModel,
@@ -867,6 +871,7 @@ export class LunaCodeController {
         model: cfg.summarizerModel || cfg.model,
         dataCollection: cfg.dataCollection,
         zdr: cfg.zeroDataRetention,
+        providerSort: cfg.providerSort,
       });
       const recent = this.context
         .getMessages()
@@ -900,7 +905,7 @@ export class LunaCodeController {
   }
 
   /** What's in the context window right now — powers the context inspector. */
-  private sendContextInfo() {
+  private async sendContextInfo() {
     const cfg = getConfig();
     const root = this.workspaceRoot();
     const messages = this.context.getMessages();
@@ -930,8 +935,8 @@ export class LunaCodeController {
       baseUrl: cfg.baseUrl,
       model: cfg.model,
     });
-    const budget = this.effectiveContextBudget(cfg, client);
-    const price = this.modelMeta.get(cfg.model)?.promptPrice;
+    const budget = await this.effectiveContextBudget(cfg, client);
+    const price = this.lookupModelMeta(cfg.model)?.promptPrice;
     this.post({
       type: "contextInfo",
       info: {
@@ -1167,6 +1172,7 @@ export class LunaCodeController {
       model: cfg.model,
       dataCollection: cfg.dataCollection,
       zdr: cfg.zeroDataRetention,
+      providerSort: cfg.providerSort,
     });
     const allowsMutation = MODES[this.mode].allowsMutation;
     const tools = [
@@ -1190,16 +1196,24 @@ export class LunaCodeController {
    * whole context). Cheap models get their full window; expensive models get
    * a smaller, stable, still-cached context.
    */
-  private effectiveContextBudget(
+  private async effectiveContextBudget(
     cfg: ReturnType<typeof getConfig>,
     client: OpenRouterClient
-  ): number {
+  ): Promise<number> {
     if (cfg.maxContextTokens > 0) return cfg.maxContextTokens;
-    const meta = this.modelMeta.get(cfg.model);
+    let meta = this.lookupModelMeta(cfg.model);
     if (!meta) {
-      void this.loadModelMeta(client); // non-blocking; next turn picks it up
-      return 180_000;
+      // Wait (briefly) for /models so the first turn of a session already
+      // runs with the real window instead of the 180k fallback. A hung
+      // fetch never blocks the turn — the load keeps going in the
+      // background and later turns pick it up.
+      await Promise.race([
+        this.loadModelMeta(client, cfg.model),
+        new Promise((r) => setTimeout(r, 2500)),
+      ]);
+      meta = this.lookupModelMeta(cfg.model);
     }
+    if (!meta) return 180_000;
     const windowCap = meta.contextLength
       ? Math.floor(meta.contextLength * 0.8)
       : 180_000;
@@ -1210,23 +1224,42 @@ export class LunaCodeController {
     return Math.max(32_000, Math.min(windowCap, priceCap));
   }
 
-  private async loadModelMeta(client: OpenRouterClient) {
-    if (this.modelMetaLoading || this.modelMeta.size > 0) return;
-    this.modelMetaLoading = true;
-    try {
-      const models = await client.listModels();
-      for (const m of models) {
-        const promptPrice = Number.parseFloat(m.pricing?.prompt ?? "");
-        this.modelMeta.set(m.id, {
-          contextLength: m.contextLength,
-          promptPrice: Number.isFinite(promptPrice) ? promptPrice : undefined,
-        });
-      }
-    } catch {
-      // Offline or API hiccup: stay on the fallback budget.
-    } finally {
-      this.modelMetaLoading = false;
+  /** Metadata for a model id, tolerating ":variant" suffixes (e.g. ":free",
+   * ":thinking") that the /models list may key differently. */
+  private lookupModelMeta(model: string) {
+    return this.modelMeta.get(model) ?? this.modelMeta.get(model.split(":")[0]);
+  }
+
+  /** Fetch model metadata, deduped across concurrent callers. Re-fetches (at
+   * most every 5 minutes) when the requested model is missing from the cached
+   * list — newly released or renamed ids would otherwise be stuck on the
+   * fallback budget forever. */
+  private loadModelMeta(client: OpenRouterClient, wantModel?: string): Promise<void> {
+    const known = wantModel ? !!this.lookupModelMeta(wantModel) : this.modelMeta.size > 0;
+    if (known) return Promise.resolve();
+    if (this.modelMetaPromise) return this.modelMetaPromise;
+    if (this.modelMeta.size > 0 && Date.now() - this.modelMetaFetchedAt < 300_000) {
+      // The model genuinely isn't in the list; don't hammer /models.
+      return Promise.resolve();
     }
+    this.modelMetaPromise = (async () => {
+      try {
+        const models = await client.listModels();
+        for (const m of models) {
+          const promptPrice = Number.parseFloat(m.pricing?.prompt ?? "");
+          this.modelMeta.set(m.id, {
+            contextLength: m.contextLength,
+            promptPrice: Number.isFinite(promptPrice) ? promptPrice : undefined,
+          });
+        }
+        this.modelMetaFetchedAt = Date.now();
+      } catch {
+        // Offline or API hiccup: stay on the fallback budget.
+      } finally {
+        this.modelMetaPromise = null;
+      }
+    })();
+    return this.modelMetaPromise;
   }
 
   private askApproval(req: ApprovalRequest): Promise<ApprovalDecision> {

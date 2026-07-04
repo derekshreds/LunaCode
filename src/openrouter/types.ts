@@ -106,4 +106,6 @@ export type StreamEvent =
   | { type: "tool_call_delta"; index: number; argsDelta: string }
   | { type: "usage"; usage: Usage }
   | { type: "done"; finishReason: string | null }
-  | { type: "error"; message: string };
+  // A transient failure is being retried; `attempt` is the attempt that failed.
+  | { type: "retry"; attempt: number; maxAttempts: number; reason: string }
+  | { type: "error"; message: string; code?: number };
