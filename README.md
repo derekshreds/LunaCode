@@ -2,8 +2,8 @@
   <img src="media/icon.png" alt="Luna Code" width="140" />
 </p>
 
-<h1 align="center">Luna Code</h3>
-<h3 align="center">AI Coding Agent for VS Code</h5>
+<h3 align="center">Luna Code</h3>
+<h5 align="center">AI Coding Agent for VS Code</h5>
 
 Luna Code is an **agentic coding assistant** that runs entirely on
 [OpenRouter](https://openrouter.ai). Point it at any model OpenRouter supports
