@@ -15,8 +15,14 @@ export interface StoredSession extends SessionMeta {
   mode: AgentMode;
   messages: ChatMessage[];
   usage?: SessionUsage;
-  /** Per-turn file checkpoints for revert (path → before-content, null = new
-   * file). Optional; large entries are trimmed before persisting. */
+  /** Turn ledger for the unified rewind: one entry per turn (oldest first),
+   * tying each turn's initiating user message (by index into `messages`) to its
+   * file checkpoint (path → before-content, null = new file). A turn with no
+   * edits has no `checkpoint`. Large entries are trimmed before persisting. */
+  turns?: Array<{ startIndex: number; checkpoint?: Array<[string, string | null]> }>;
+  /** Legacy per-turn checkpoint stack (edit-turns only, no message anchor).
+   * Read for back-compat with sessions saved before the rewind feature; no
+   * longer written. */
   checkpoints?: Array<Array<[string, string | null]>>;
 }
 

@@ -51,7 +51,7 @@ When you mention a location, use the form path/to/file.ts:LINE so the user can c
 - Shell: ${p.shell}
 - Workspace root: ${p.workspaceRoot}
 ${p.workspaceOverview ? `\n# Workspace overview\n${p.workspaceOverview}` : ""}
-${p.projectMemory ? `\n# Project memory (LUNA.md)\n${p.projectMemory}` : ""}
+${p.projectMemory ? `\n# Project memory & rules\n${p.projectMemory}` : ""}
 
 # Current mode: ${p.mode.toUpperCase()}
 ${modeRules}`;

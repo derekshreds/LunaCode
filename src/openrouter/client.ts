@@ -21,6 +21,14 @@ export interface OpenRouterClientOptions {
    * default load balancing. Throughput/latency cut down upstream idle
    * timeouts from slow providers on big contexts. */
   providerSort?: "throughput" | "latency" | "price";
+  /** Restrict routing to providers serving these quantization levels (e.g.
+   * ["fp8","fp16","bf16"]). Empty/undefined = no restriction. Use to avoid being
+   * routed to low-precision (e.g. fp4) endpoints. */
+  quantizations?: string[];
+  /** Thinking effort for reasoning-capable models. "off" disables reasoning;
+   * low/medium/high map to OpenRouter's unified `reasoning.effort`. Undefined =
+   * the model's default. */
+  reasoningEffort?: "off" | "low" | "medium" | "high";
   /** Override the stall watchdog (ms without a data frame); for tests. */
   stallTimeoutMs?: number;
 }
@@ -93,6 +101,15 @@ export interface CompletionParams {
  * incrementally, normalizing OpenAI-style deltas into discrete StreamEvents so
  * the agent loop can consume text, reasoning, tool calls, and usage uniformly.
  */
+/** Map the reasoning-effort option to OpenRouter's unified `reasoning` param.
+ * Undefined effort → undefined (omitted → the model's own default). */
+function reasoningParam(
+  effort?: "off" | "low" | "medium" | "high"
+): Record<string, unknown> | undefined {
+  if (!effort) return undefined;
+  return effort === "off" ? { enabled: false } : { effort };
+}
+
 export class OpenRouterClient {
   constructor(private opts: OpenRouterClientOptions) {}
 
@@ -102,6 +119,44 @@ export class OpenRouterClient {
 
   get model(): string {
     return this.opts.model;
+  }
+
+  /** Generation id of the most recent stream, for post-hoc cost lookup when a
+   * turn was cancelled before the usage frame arrived. */
+  private lastGenId: string | null = null;
+  get generationId(): string | null {
+    return this.lastGenId;
+  }
+
+  /** Best-effort actual usage/cost for a generation via OpenRouter's
+   * /generation endpoint. Used when a stream was aborted before its usage
+   * frame. Retries briefly (the record finalizes shortly after). Null on
+   * failure. */
+  async fetchGenerationCost(
+    id: string
+  ): Promise<{ prompt_tokens: number; completion_tokens: number; cost: number; cachedTokens: number } | null> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await fetch(`${this.opts.baseUrl}/generation?id=${encodeURIComponent(id)}`, {
+          headers: this.headers(),
+        });
+        if (res.ok) {
+          const d = (await res.json())?.data;
+          if (d && d.total_cost != null) {
+            return {
+              prompt_tokens: Number(d.tokens_prompt ?? d.native_tokens_prompt ?? 0) || 0,
+              completion_tokens: Number(d.tokens_completion ?? d.native_tokens_completion ?? 0) || 0,
+              cost: Number(d.total_cost) || 0,
+              cachedTokens: Number(d.native_tokens_cached ?? 0) || 0,
+            };
+          }
+        }
+      } catch {
+        /* transient — retry */
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return null;
   }
 
   private headers(): Record<string, string> {
@@ -140,7 +195,9 @@ export class OpenRouterClient {
       provider: {
         data_collection: this.opts.dataCollection ?? "deny",
         ...(this.opts.providerSort ? { sort: this.opts.providerSort } : {}),
+        ...(this.opts.quantizations?.length ? { quantizations: this.opts.quantizations } : {}),
       },
+      reasoning: reasoningParam(this.opts.reasoningEffort),
       zdr: this.opts.zdr ? true : undefined,
     };
 
@@ -156,6 +213,7 @@ export class OpenRouterClient {
     // streamed text, tool calls, or usage do.
     let committed = false;
     let servedModel: string | null = null;
+    this.lastGenId = null;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       let res: Response;
@@ -252,6 +310,7 @@ export class OpenRouterClient {
           });
           return { events, terminal: true, meaningful: true };
         }
+        if (typeof json.id === "string" && json.id) this.lastGenId = json.id;
         // Surface which model actually served the request — ONLY when fallback
         // routing is configured and the served model is one of the fallbacks.
         // Providers report versioned slugs (e.g. "vendor/model-20260616" for

@@ -20,8 +20,15 @@ export interface LunaCodeConfig {
   prewarmCache: boolean;
   sessionBudgetUsd: number;
   maxTurns: number;
+  /** Stop a turn if the same file/command is mutated more than this many times
+   * (runaway-loop guard). 0 = disabled. */
+  loopGuardLimit: number;
+  /** Thinking effort passed to reasoning-capable models. "default" = model's own. */
+  reasoningEffort: "default" | "off" | "low" | "medium" | "high";
   includeActiveFile: boolean;
   formatAfterEdit: boolean;
+  /** Reveal each edited file in a preview tab as the agent writes it. */
+  revealEditedFiles: boolean;
   worktreeMode: boolean;
   customCommands: Record<string, string>;
   autoApproveCommands: string[];
@@ -30,6 +37,11 @@ export interface LunaCodeConfig {
   zeroDataRetention: boolean;
   /** OpenRouter provider ranking; undefined = OpenRouter's default load balancing. */
   providerSort?: "throughput" | "latency" | "price";
+  /** Allowed provider quantization levels (e.g. ["fp8","fp16","bf16"]); empty =
+   * no restriction. Avoids routing to low-precision (fp4) endpoints. */
+  quantizations: string[];
+  /** Preferred models surfaced first in the model quick-pick; empty = show all. */
+  favoriteModels: string[];
   mcpServers: Record<string, McpServerConfig>;
 }
 
@@ -37,7 +49,7 @@ export function getConfig(): LunaCodeConfig {
   const c = vscode.workspace.getConfiguration("lunacode");
   const mode = c.get<string>("defaultMode", "standard");
   return {
-    model: c.get<string>("model", "deepseek/deepseek-v4-flash"),
+    model: c.get<string>("model", "z-ai/glm-5.2"),
     baseUrl: c.get<string>("baseUrl", "https://openrouter.ai/api/v1").replace(/\/$/, ""),
     defaultMode: isMode(mode) ? mode : "standard",
     maxTokens: c.get<number>("maxTokens", 0),
@@ -52,8 +64,11 @@ export function getConfig(): LunaCodeConfig {
     prewarmCache: c.get<boolean>("prewarmCache", false),
     sessionBudgetUsd: Math.max(0, c.get<number>("sessionBudgetUsd", 0) || 0),
     maxTurns: Math.max(0, Math.floor(c.get<number>("maxTurns", 200) || 0)),
+    loopGuardLimit: Math.max(0, Math.floor(c.get<number>("loopGuardLimit", 10) || 0)),
+    reasoningEffort: parseReasoningEffort(c.get<string>("reasoningEffort", "default")),
     includeActiveFile: c.get<boolean>("includeActiveFile", true),
     formatAfterEdit: c.get<boolean>("formatAfterEdit", false),
+    revealEditedFiles: c.get<boolean>("revealEditedFiles", false),
     worktreeMode: c.get<boolean>("worktreeMode", false),
     customCommands: c.get<Record<string, string>>("customCommands", {}) ?? {},
     autoApproveCommands: c.get<string[]>("autoApproveCommands", []),
@@ -61,6 +76,8 @@ export function getConfig(): LunaCodeConfig {
     dataCollection: c.get<string>("dataCollection", "deny") === "allow" ? "allow" : "deny",
     zeroDataRetention: c.get<boolean>("zeroDataRetention", false),
     providerSort: parseProviderSort(c.get<string>("providerSort", "throughput")),
+    quantizations: sanitizeQuantizations(c.get<string[]>("quantizations", [])),
+    favoriteModels: (c.get<string[]>("favoriteModels", []) ?? []).filter(Boolean),
     mcpServers: c.get<Record<string, McpServerConfig>>("mcpServers", {}) ?? {},
   };
 }
@@ -71,6 +88,27 @@ function clamp(n: number, lo: number, hi: number, fallback: number): number {
 
 function parseProviderSort(v: string): "throughput" | "latency" | "price" | undefined {
   return v === "throughput" || v === "latency" || v === "price" ? v : undefined;
+}
+
+function parseReasoningEffort(v: string): "default" | "off" | "low" | "medium" | "high" {
+  return v === "off" || v === "low" || v === "medium" || v === "high" ? v : "default";
+}
+
+const VALID_QUANTIZATIONS = new Set([
+  "int4", "int8", "fp4", "fp6", "fp8", "fp16", "bf16", "fp32", "unknown",
+]);
+
+/** Accept comma- or newline-separated entries, lowercase, and drop anything
+ * that isn't a valid OpenRouter quantization — so a stray value can't 400. */
+function sanitizeQuantizations(raw: string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const entry of raw ?? []) {
+    for (const part of String(entry).split(/[,\s]+/)) {
+      const q = part.trim().toLowerCase();
+      if (VALID_QUANTIZATIONS.has(q) && !out.includes(q)) out.push(q);
+    }
+  }
+  return out;
 }
 
 export async function setModel(model: string): Promise<void> {

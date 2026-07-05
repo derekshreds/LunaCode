@@ -88,8 +88,47 @@ function messageChars(m: ChatMessage): number {
 export class ContextManager {
   private systemPrompt = "";
   private messages: ChatMessage[] = [];
+  // Stable per-message ids, index-aligned with `messages`. `messages` is spliced
+  // by compaction and rollback, so positional indices are not stable across
+  // turns — ids are. `turnStartIds` marks the ids that begin a turn (vs. mid-turn
+  // steering); the rewind feature targets turn starts.
+  private ids: number[] = [];
+  private idSeq = 0;
+  private turnStartIds = new Set<number>();
 
   constructor(private cachingEnabled: boolean) {}
+
+  /** The id the NEXT added message will receive. Captured at turn start so the
+   * controller can tie a turn to its initiating user message deterministically. */
+  peekIdSeq(): number {
+    return this.idSeq;
+  }
+
+  /** Live index of a message id, or -1 if it was compacted/rolled away. */
+  indexOfId(id: number): number {
+    return this.ids.indexOf(id);
+  }
+
+  /** Turn-initiating user messages still present, oldest first — the rewind
+   * targets. */
+  getTurnStarts(): Array<{ id: number; index: number; text: string }> {
+    const out: Array<{ id: number; index: number; text: string }> = [];
+    for (let i = 0; i < this.messages.length; i++) {
+      const id = this.ids[i];
+      if (!this.turnStartIds.has(id)) continue;
+      out.push({ id, index: i, text: this.userTextAndImages(this.messages[i]).text });
+    }
+    return out;
+  }
+
+  /** Keep `ids` aligned with a splice on `messages`: drop the removed ids from
+   * `turnStartIds` and insert `insertCount` fresh (non-turn-start) ids. */
+  private spliceIds(start: number, deleteCount: number, insertCount: number) {
+    const fresh: number[] = [];
+    for (let i = 0; i < insertCount; i++) fresh.push(this.idSeq++);
+    const removed = this.ids.splice(start, deleteCount, ...fresh);
+    for (const rid of removed) this.turnStartIds.delete(rid);
+  }
 
   setSystemPrompt(text: string) {
     this.systemPrompt = text;
@@ -101,35 +140,49 @@ export class ContextManager {
 
   reset() {
     this.messages = [];
+    this.ids = [];
+    this.turnStartIds.clear();
   }
 
   getMessages(): ChatMessage[] {
     return this.messages;
   }
 
-  /** Replace the conversation (used when loading a saved session). */
-  loadMessages(messages: ChatMessage[]) {
+  /** Replace the conversation (used when loading a saved session).
+   * `turnStartIndices` (indices into `messages`) restores which messages begin a
+   * turn so rewind targets survive a reload. */
+  loadMessages(messages: ChatMessage[], turnStartIndices?: number[]) {
     this.messages = messages.map((m) => ({ ...m }));
+    this.ids = this.messages.map(() => this.idSeq++);
+    this.turnStartIds = new Set(
+      (turnStartIndices ?? []).map((i) => this.ids[i]).filter((id): id is number => id !== undefined)
+    );
   }
 
-  addUser(text: string, images?: string[]) {
+  addUser(text: string, images?: string[], opts?: { turnStart?: boolean }) {
+    const id = this.idSeq++;
+    if (opts?.turnStart) this.turnStartIds.add(id);
     if (images && images.length) {
       const parts: ContentPart[] = [{ type: "text", text }];
       for (const url of images) {
         parts.push({ type: "image_url", image_url: { url } });
       }
       this.messages.push({ role: "user", content: parts });
+      this.ids.push(id);
       return;
     }
     this.messages.push({ role: "user", content: text });
+    this.ids.push(id);
   }
 
   addAssistant(msg: AssistantMessage) {
     this.messages.push(msg);
+    this.ids.push(this.idSeq++);
   }
 
   addToolResult(toolCallId: string, content: string) {
     this.messages.push({ role: "tool", tool_call_id: toolCallId, content });
+    this.ids.push(this.idSeq++);
   }
 
   /** Total estimated tokens including the system prompt. */
@@ -175,6 +228,7 @@ export class ContextManager {
             "[Luna Code checkpoint — earlier conversation summarized]\n" +
             summary.text.trim(),
         });
+        this.spliceIds(span.start, span.end - span.start, 1);
         summarized = true;
       } else {
         this.legacyCompact(span.start, target);
@@ -298,9 +352,11 @@ export class ContextManager {
     let removedCount = 0;
     while (this.estimate() > target && start < this.lastUserIndex()) {
       this.messages.splice(start, 1);
+      this.spliceIds(start, 1, 0);
       removedCount++;
       while (start < this.lastUserIndex() && this.messages[start]?.role === "tool") {
         this.messages.splice(start, 1);
+        this.spliceIds(start, 1, 0);
         removedCount++;
       }
     }
@@ -309,6 +365,7 @@ export class ContextManager {
         role: "assistant",
         content: `[Luna Code: ${removedCount} earlier message(s) were dropped to stay within the context budget. Re-read any files if you need their current contents.]`,
       });
+      this.spliceIds(start, 0, 1);
     }
   }
 
@@ -369,9 +426,30 @@ export class ContextManager {
    * when there is no user message (nothing to roll back).
    */
   rollbackToLastUser(): { text: string; images: string[] } | null {
-    const idx = this.lastUserIndex();
-    if (idx < 0) return null;
-    const m = this.messages[idx];
+    return this.rollbackToIndex(this.lastUserIndex());
+  }
+
+  /** Roll back to a specific message id (a turn start). */
+  rollbackToId(id: number): { text: string; images: string[] } | null {
+    return this.rollbackToIndex(this.indexOfId(id));
+  }
+
+  /**
+   * Remove the message at `idx` (which must be a user message) and everything
+   * after it, returning its text and any images. Cutting at a user-message
+   * boundary keeps the tool_call/tool-result pairing invariant intact.
+   */
+  rollbackToIndex(idx: number): { text: string; images: string[] } | null {
+    if (idx < 0 || idx >= this.messages.length) return null;
+    if (this.messages[idx].role !== "user") return null;
+    const payload = this.userTextAndImages(this.messages[idx]);
+    this.messages.splice(idx);
+    const removed = this.ids.splice(idx);
+    for (const rid of removed) this.turnStartIds.delete(rid);
+    return payload;
+  }
+
+  private userTextAndImages(m: ChatMessage): { text: string; images: string[] } {
     let text = "";
     const images: string[] = [];
     if (typeof m.content === "string") {
@@ -383,7 +461,6 @@ export class ContextManager {
       }
       text = text.trim();
     }
-    this.messages.splice(idx);
     return { text, images };
   }
 

@@ -21,6 +21,13 @@ async function main() {
       // usage.ts imports 'vscode' at module scope; stub it for Node.
       alias: { vscode: "./scripts/vscode-stub.ts" },
     }),
+    esbuild.build({
+      entryPoints: ["scripts/test-checkpoints.ts"],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: "dist/test-checkpoints.js",
+    }),
   ]);
 }
 

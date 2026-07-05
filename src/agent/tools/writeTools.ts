@@ -1,8 +1,34 @@
+import * as vscode from "vscode";
 import * as fsp from "fs/promises";
 import * as path from "path";
 import { Tool, ToolContext, ToolResult } from "./types";
 import { fileExists, resolveInWorkspace } from "./util";
 import { computeDiff } from "../../diff";
+
+/**
+ * Write file contents. If the file is currently open in the editor, route the
+ * change through a WorkspaceEdit so it lands on VS Code's native undo stack and
+ * doesn't trigger a "file changed on disk" conflict with the buffer; then save
+ * so disk (checkpoints, git, disk-based diagnostics) stays consistent. Files
+ * that aren't open are written straight to disk as before.
+ */
+async function writeFileContents(abs: string, content: string): Promise<void> {
+  const open = vscode.workspace.textDocuments.find(
+    (d) => d.uri.scheme === "file" && d.uri.fsPath === abs
+  );
+  if (open) {
+    const edit = new vscode.WorkspaceEdit();
+    const end = open.lineCount > 0 ? open.lineAt(open.lineCount - 1).range.end : new vscode.Position(0, 0);
+    edit.replace(open.uri, new vscode.Range(new vscode.Position(0, 0), end), content);
+    if (await vscode.workspace.applyEdit(edit)) {
+      await Promise.resolve(open.save()).catch(() => {});
+      return;
+    }
+    // Fall through to a disk write if the edit was rejected.
+  }
+  await fsp.mkdir(path.dirname(abs), { recursive: true });
+  await fsp.writeFile(abs, content, "utf8");
+}
 
 export const writeFileTool: Tool = {
   name: "write_file",
@@ -33,8 +59,7 @@ export const writeFileTool: Tool = {
       return { content: `User rejected writing ${args.path}.`, isError: true };
     }
 
-    await fsp.mkdir(path.dirname(abs), { recursive: true });
-    await fsp.writeFile(abs, args.content, "utf8");
+    await writeFileContents(abs, args.content);
     const lines = args.content.split("\n").length;
     return {
       content: `${existed ? "Overwrote" : "Created"} ${args.path} (${lines} lines).`,
@@ -177,8 +202,7 @@ export const applyPatchTool: Tool = {
         continue;
       }
       try {
-        await fsp.mkdir(path.dirname(p.abs), { recursive: true });
-        await fsp.writeFile(p.abs, p.after, "utf8");
+        await writeFileContents(p.abs, p.after);
         lines.push(
           typeof p.change.content === "string"
             ? `✓ ${p.change.path} (${p.existed ? "overwrote" : "created"})`
@@ -260,7 +284,7 @@ export const editFileTool: Tool = {
       return { content: `User rejected editing ${args.path}.`, isError: true };
     }
 
-    await fsp.writeFile(abs, after, "utf8");
+    await writeFileContents(abs, after);
     return {
       content: `Edited ${args.path} (${count} replacement${count === 1 ? "" : "s"}).`,
       ui: { path: args.path, action: "edit", replacements: count, diff },

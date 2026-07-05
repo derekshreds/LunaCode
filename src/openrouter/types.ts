@@ -80,6 +80,8 @@ export interface ChatCompletionRequest {
   usage?: { include: boolean };
   // OpenRouter provider routing preferences (e.g. { data_collection: "deny" }).
   provider?: Record<string, unknown>;
+  // OpenRouter unified reasoning control (e.g. { effort: "high" } or { enabled: false }).
+  reasoning?: Record<string, unknown>;
   // Per-request Zero Data Retention enforcement.
   zdr?: boolean;
 }

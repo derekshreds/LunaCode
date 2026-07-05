@@ -210,14 +210,19 @@ async function pickModel(secrets: SecretStore, controller: LunaCodeController) {
   const cfg = getConfig();
   const apiKey = await secrets.getApiKey();
 
-  // A tiny set of cheap, capable favorites for quick swapping. This is NOT the
-  // source of truth — "Browse all" fetches the live OpenRouter catalog, so add
-  // long-lived favorites here only and let Browse all cover everything else.
-  const curated: vscode.QuickPickItem[] = [
-    { label: "deepseek/deepseek-v4-flash", description: "DeepSeek · fastest & cheapest" },
-    { label: "deepseek/deepseek-v4-pro", description: "DeepSeek · strong agentic coder, great value" },
-    { label: "$(search) Browse all OpenRouter models…", description: "Fetch the full live list" },
-  ];
+  // The user's configured favorites drive the quick list; otherwise fall back to
+  // a tiny built-in set. "Browse all" always fetches the full live catalog.
+  const curated: vscode.QuickPickItem[] = cfg.favoriteModels.length
+    ? cfg.favoriteModels.map((m) => ({
+        label: m,
+        description: m === cfg.model ? "current" : "favorite",
+      }))
+    : [
+        { label: "z-ai/glm-5.2", description: "Z.AI GLM · default" },
+        { label: "deepseek/deepseek-v4-flash", description: "DeepSeek · fastest & cheapest" },
+        { label: "deepseek/deepseek-v4-pro", description: "DeepSeek · strong agentic coder, great value" },
+      ];
+  curated.push({ label: "$(search) Browse all OpenRouter models…", description: "Fetch the full live list" });
 
   const choice = await vscode.window.showQuickPick(curated, {
     title: "Select OpenRouter Model",

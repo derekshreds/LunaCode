@@ -200,7 +200,7 @@
       "properties": {
         "lunacode.model": {
           "type": "string",
-          "default": "deepseek/deepseek-v4-flash",
+          "default": "z-ai/glm-5.2",
           "description": "OpenRouter model id used for agentic coding sessions. Use the model picker (or browse the live list at https://openrouter.ai/models) for current ids."
         },
         "lunacode.baseUrl": {
@@ -233,6 +233,19 @@
           "default": 0,
           "description": "Sampling temperature. 0 is best for deterministic agentic coding."
         },
+        "lunacode.reasoningEffort": {
+          "type": "string",
+          "enum": ["default", "off", "low", "medium", "high"],
+          "enumDescriptions": [
+            "Use the model's own default reasoning behavior.",
+            "Disable reasoning/thinking entirely.",
+            "Low thinking effort — faster and cheaper.",
+            "Medium thinking effort.",
+            "High thinking effort — most deliberate, slower and pricier."
+          ],
+          "default": "default",
+          "description": "Thinking effort for reasoning-capable models, via OpenRouter's unified reasoning control. Lowering it (or Off) can curb runaway repeat-thinking loops; raising it helps hard problems."
+        },
         "lunacode.enablePromptCaching": {
           "type": "boolean",
           "default": true,
@@ -264,6 +277,15 @@
           ],
           "default": "throughput",
           "description": "How OpenRouter picks among providers serving the model. Throughput/latency reduce provider stalls (upstream idle timeouts) at potentially higher cost per token."
+        },
+        "lunacode.quantizations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["int4", "int8", "fp4", "fp6", "fp8", "fp16", "bf16", "fp32", "unknown"]
+          },
+          "default": [],
+          "description": "Restrict routing to providers serving the model at these quantization levels. Empty = no restriction. To avoid low-precision (fp4) endpoints, list the acceptable levels, e.g. [\"fp8\",\"fp16\",\"bf16\",\"fp32\"] (or just [\"fp8\"] to require exactly fp8). Providers not serving one of the listed quantizations are skipped."
         },
         "lunacode.maxContextTokens": {
           "type": "number",
@@ -305,6 +327,12 @@
           "minimum": 0,
           "description": "Maximum number of tool-loop steps the agent runs in a single turn before stopping. Higher values let the agent finish long tasks and plans in Auto mode without stalling. 0 = unlimited."
         },
+        "lunacode.loopGuardLimit": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "description": "Stop the current turn if the model rewrites the same file (or re-runs the same command) more than this many times — catches runaway 'second-guess and rewrite' loops that burn tokens without progress. 0 = disabled."
+        },
         "lunacode.includeActiveFile": {
           "type": "boolean",
           "default": true,
@@ -314,6 +342,11 @@
           "type": "boolean",
           "default": false,
           "description": "Run the workspace's document formatter on files right after the agent edits them, so its changes match project style."
+        },
+        "lunacode.revealEditedFiles": {
+          "type": "boolean",
+          "default": false,
+          "description": "As the agent edits files, reveal each one in a preview tab (without stealing focus from the chat) so you can watch changes land. Off by default — enable to follow along in the editor."
         },
         "lunacode.worktreeMode": {
           "type": "boolean",
@@ -331,6 +364,12 @@
           "items": { "type": "string" },
           "default": [],
           "description": "Models to fall back to (in order) when the primary model errors or is rate-limited, via OpenRouter's models routing. A status line notes when a fallback served the response."
+        },
+        "lunacode.favoriteModels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Your preferred model IDs (e.g. \"anthropic/claude-sonnet-5\"). When set, these are shown first in the model quick-pick (with an option to browse the full catalog). Empty = list all models."
         },
         "lunacode.prewarmCache": {
           "type": "boolean",
@@ -398,7 +437,7 @@
     "check-types": "tsc --noEmit",
     "lint": "echo \"(no lint configured)\"",
     "pretest": "node scripts/build-tests.js",
-    "test": "node dist/test-context.js && node dist/test-usage.js"
+    "test": "node dist/test-context.js && node dist/test-usage.js && node dist/test-checkpoints.js"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
