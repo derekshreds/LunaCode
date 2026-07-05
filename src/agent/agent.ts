@@ -103,9 +103,11 @@ export interface AgentDeps {
   /** Session budget check: returns {spent, limit} when the session cost has
    * crossed the configured budget, else null. */
   checkBudget?: () => { spent: number; limit: number } | null;
+  /** Max tool-loop iterations per turn. 0 (or undefined) = unlimited. */
+  maxTurns?: number;
 }
 
-const MAX_TOOL_ITERATIONS = 50;
+const DEFAULT_MAX_TURNS = 200;
 
 /**
  * Drives a single user turn to completion: streams assistant output, executes
@@ -158,8 +160,12 @@ export class Agent {
     this.toolMap = new Map(tools.map((t) => [t.name, t]));
     const toolDefs = toToolDefinitions(tools);
 
+    // 0 = unlimited; undefined falls back to the default cap.
+    const configuredMaxTurns = this.deps.maxTurns ?? DEFAULT_MAX_TURNS;
+    const maxIterations = configuredMaxTurns > 0 ? configuredMaxTurns : Infinity;
+
     try {
-      for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+      for (let iter = 0; iter < maxIterations; iter++) {
         if (signal.aborted) {
           this.cb.onEvent({ type: "turn_end", stopReason: "cancelled" });
           return;
@@ -432,7 +438,7 @@ export class Agent {
       }
       this.cb.onEvent({
         type: "status",
-        message: `Reached the ${MAX_TOOL_ITERATIONS}-step limit for this turn.`,
+        message: `Reached the ${configuredMaxTurns}-step limit for this turn.`,
       });
       this.cb.onEvent({ type: "turn_end", stopReason: "max_iterations" });
     } catch (e: any) {

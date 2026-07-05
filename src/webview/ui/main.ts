@@ -1293,6 +1293,13 @@ function showSettings(s: SettingsPayload) {
   const beh = setGroup("Agent Behavior");
   beh.appendChild(
     setRow(
+      "Max turns per task",
+      "Tool-loop steps the agent runs before stopping. Raise it so long tasks and plans (esp. Auto mode) finish without stalling. 0 = unlimited.",
+      numberSetting("maxTurns", s.maxTurns, { min: 0, step: 10 })
+    )
+  );
+  beh.appendChild(
+    setRow(
       "Include active file",
       "Attach the file (and selection) you're looking at to each message.",
       toggleSetting("includeActiveFile", s.includeActiveFile)

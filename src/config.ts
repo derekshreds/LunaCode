@@ -19,6 +19,7 @@ export interface LunaCodeConfig {
   fallbackModels: string[];
   prewarmCache: boolean;
   sessionBudgetUsd: number;
+  maxTurns: number;
   includeActiveFile: boolean;
   formatAfterEdit: boolean;
   worktreeMode: boolean;
@@ -50,6 +51,7 @@ export function getConfig(): LunaCodeConfig {
     fallbackModels: (c.get<string[]>("fallbackModels", []) ?? []).filter(Boolean),
     prewarmCache: c.get<boolean>("prewarmCache", false),
     sessionBudgetUsd: Math.max(0, c.get<number>("sessionBudgetUsd", 0) || 0),
+    maxTurns: Math.max(0, Math.floor(c.get<number>("maxTurns", 200) || 0)),
     includeActiveFile: c.get<boolean>("includeActiveFile", true),
     formatAfterEdit: c.get<boolean>("formatAfterEdit", false),
     worktreeMode: c.get<boolean>("worktreeMode", false),

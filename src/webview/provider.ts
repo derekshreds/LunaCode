@@ -317,6 +317,7 @@ export class LunaCodeController {
         zeroDataRetention: cfg.zeroDataRetention,
         providerSort: cfg.providerSort ?? "default",
         sessionBudgetUsd: cfg.sessionBudgetUsd,
+        maxTurns: cfg.maxTurns,
         includeActiveFile: cfg.includeActiveFile,
         formatAfterEdit: cfg.formatAfterEdit,
         worktreeMode: cfg.worktreeMode,
@@ -338,6 +339,7 @@ export class LunaCodeController {
     "fallbackModels",
     "prewarmCache",
     "sessionBudgetUsd",
+    "maxTurns",
     "includeActiveFile",
     "formatAfterEdit",
     "worktreeMode",
@@ -709,6 +711,7 @@ export class LunaCodeController {
         summarizerModel: cfg.summarizerModel || cfg.model,
         compactionTargetRatio: cfg.compactionTargetRatio,
         subagentModel: cfg.subagentModel,
+        maxTurns: cfg.maxTurns,
         snapshotFile: (relPath) => this.snapshotFile(root, relPath),
         extraTools: (this.sessionMcpTools ??= this.mcp.getTools()),
         // Mid-turn steering: the agent drains queued messages each iteration.

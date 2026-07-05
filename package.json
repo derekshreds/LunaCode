@@ -299,6 +299,12 @@
           "default": 0,
           "description": "Session spending limit in USD. When a session's total cost crosses this, Luna Code pauses and asks before continuing (even in Auto mode). 0 disables the guardrail."
         },
+        "lunacode.maxTurns": {
+          "type": "number",
+          "default": 200,
+          "minimum": 0,
+          "description": "Maximum number of tool-loop steps the agent runs in a single turn before stopping. Higher values let the agent finish long tasks and plans in Auto mode without stalling. 0 = unlimited."
+        },
         "lunacode.includeActiveFile": {
           "type": "boolean",
           "default": true,

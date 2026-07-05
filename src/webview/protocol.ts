@@ -119,6 +119,7 @@ export interface SettingsPayload {
   zeroDataRetention: boolean;
   providerSort: "throughput" | "latency" | "price" | "default";
   sessionBudgetUsd: number;
+  maxTurns: number;
   includeActiveFile: boolean;
   formatAfterEdit: boolean;
   worktreeMode: boolean;
