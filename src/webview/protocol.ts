@@ -12,6 +12,9 @@ export interface DiffRow {
   left?: DiffCell;
   right?: DiffCell;
   gap?: string; // a collapsed-context separator label (e.g. "@@ … @@")
+  /** Index of the change block (hunk) this row belongs to — changed rows only.
+   * Used for per-hunk revert; matches reconstructWithReverts' numbering. */
+  hunk?: number;
 }
 export interface DiffData {
   path: string;
@@ -89,6 +92,19 @@ export interface TaskItem {
   status: "pending" | "active" | "done";
 }
 
+/** An @-mention completion. `file`/`folder`/`symbol` insert `insert` text into
+ * the composer; `problems`/`git` are resolved host-side into attached context. */
+export interface MentionItem {
+  kind: "file" | "folder" | "symbol" | "problems" | "git";
+  label: string;
+  /** Text inserted into the composer when picked (files/folders/symbols). */
+  insert?: string;
+  /** Argument passed to resolveMention for host-resolved kinds. */
+  arg?: string;
+  /** Secondary label shown dimmed (e.g. a symbol's location). */
+  detail?: string;
+}
+
 /** What the context window currently holds — for the context inspector. */
 export interface ContextInfo {
   totalTokens: number;
@@ -107,6 +123,7 @@ export interface SettingsPayload {
   summarizerModel: string;
   subagentModel: string;
   fallbackModels: string[];
+  favoriteModels: string[];
   prewarmCache: boolean;
   maxContextTokens: number;
   autoBudgetCarryCostUsd: number;
@@ -118,9 +135,14 @@ export interface SettingsPayload {
   dataCollection: "deny" | "allow";
   zeroDataRetention: boolean;
   providerSort: "throughput" | "latency" | "price" | "default";
+  quantizations: string[];
   sessionBudgetUsd: number;
+  maxTurns: number;
+  loopGuardLimit: number;
+  reasoningEffort: "default" | "off" | "low" | "medium" | "high";
   includeActiveFile: boolean;
   formatAfterEdit: boolean;
+  revealEditedFiles: boolean;
   worktreeMode: boolean;
   autoApproveCommands: string[];
   alwaysDenyCommands: string[];
@@ -141,6 +163,8 @@ export type HostToWebview =
       modes: { id: AgentMode; label: string; description: string }[];
       /** Available slash commands (builtins + custom), without the slash. */
       commands?: string[];
+      /** First configured fallback model (for the error-card retry action). */
+      fallback?: string;
     }
   | {
       type: "config";
@@ -148,8 +172,9 @@ export type HostToWebview =
       model: string;
       mode: AgentMode;
       commands?: string[];
+      fallback?: string;
     }
-  | { type: "turnStart" }
+  | { type: "turnStart"; model?: string }
   | { type: "assistantText"; delta: string }
   | { type: "reasoning"; delta: string }
   | { type: "toolStart"; id: string; name: string; args: any }
@@ -162,12 +187,14 @@ export type HostToWebview =
       diff?: DiffData;
     }
   | { type: "status"; message: string }
+  /** Queued messages were applied as steering — clear their "Queued" tags. */
+  | { type: "steeringApplied" }
   | { type: "usage"; usage: UsagePayload }
   | { type: "error"; message: string }
   | { type: "turnEnd"; stopReason: string }
   | { type: "approvalRequest"; payload: ApprovalPayload }
   | { type: "sessionReset" }
-  | { type: "userEcho"; text: string; queued?: boolean }
+  | { type: "userEcho"; text: string; queued?: boolean; echoId?: number; rewindId?: number }
   | {
       type: "sessionList";
       sessions: { id: string; title: string; updatedAt: number }[];
@@ -180,9 +207,27 @@ export type HostToWebview =
   | { type: "taskList"; tasks: TaskItem[] }
   | { type: "turnDiff"; diffs: DiffData[] }
   | { type: "contextInfo"; info: ContextInfo }
-  | { type: "fileMatches"; token: number; files: string[] }
+  | { type: "mentionMatches"; token: number; items: MentionItem[] }
   /** Remove the last user message and everything after it from the transcript. */
   | { type: "rollback" }
+  /** Data for the rewind confirmation dialog (answer to a rewindPreview request). */
+  | {
+      type: "rewindPreview";
+      id: number;
+      messagesDiscarded: number;
+      filesRestored: number;
+      filesDeleted: number;
+      horizonExceeded: boolean;
+      text: string;
+    }
+  /** Attach a rewind button to the live bubble with this echoId once its turn
+   * has started (the bubble's turn-start id is now known). */
+  | { type: "rewindAssign"; echoId: number; rewindId: number }
+  /** The set of rewindable turn-start points (id + restorable file count).
+   * Broadcast whenever the turn ledger changes. */
+  | { type: "rewindState"; points: { id: number; files: number }[] }
+  /** Truncate the transcript from the user bubble with this rewindId onward. */
+  | { type: "rewound"; id: number }
   /** Put text into the composer (edit-and-resend flow). */
   | { type: "composerFill"; text: string }
   /** Throttled live token counter while the model generates. */
@@ -210,11 +255,29 @@ export type WebviewToHost =
       key: keyof SettingsPayload;
       value: SettingsPayload[keyof SettingsPayload];
     }
-  | { type: "revertTurn" }
   | { type: "getTurnDiff" }
   | { type: "commitTurn" }
+  /** Revert one reviewed file to its pre-turn state. */
+  | { type: "revertFile"; path: string }
+  /** Revert only the listed change blocks (hunks) of a reviewed file. */
+  | { type: "revertHunks"; path: string; hunks: number[] }
+  /** Open a native side-by-side editor diff (pre-turn ↔ current) for a file. */
+  | { type: "openDiff"; path: string }
   | { type: "getContextInfo" }
   | { type: "retryTurn" }
   | { type: "editLastTurn" }
+  /** Retry the last turn after switching to a specific (fallback) model. */
+  | { type: "retryWithModel"; model: string }
+  /** Ask the host for rewind-confirm details for a turn-start message id. */
+  | { type: "rewindPreview"; id: number }
+  /** Execute a rewind to a turn-start message id.
+   *  - "rollback": restore files + trim context, then stop (composer left as-is)
+   *  - "edit": also place the rolled-back message text in the composer
+   *  - "rerun": also re-send the message immediately */
+  | { type: "rewindTo"; id: number; mode: "rollback" | "edit" | "rerun" }
   | { type: "exportSession" }
-  | { type: "queryFiles"; query: string; token: number };
+  /** Create a starter LUNA.md (project memory) and open it. */
+  | { type: "createMemory" }
+  | { type: "queryMentions"; query: string; token: number }
+  /** Resolve a host-side mention (problems/git) into attached context. */
+  | { type: "resolveMention"; kind: string; arg?: string };

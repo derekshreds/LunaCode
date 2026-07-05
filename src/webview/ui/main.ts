@@ -10,6 +10,7 @@ import {
   DiffData,
   DailyPoint,
   ModelPoint,
+  MentionItem,
 } from "../protocol";
 import { renderMarkdown } from "./markdown";
 import { highlightLine, escapeHtml } from "./highlight";
@@ -34,6 +35,8 @@ interface UiState {
   running: boolean;
   /** Slash commands available (without the slash). */
   commands: string[];
+  /** First configured fallback model (for the error-card retry action). */
+  fallback: string;
 }
 const state: UiState = {
   hasApiKey: false,
@@ -42,9 +45,14 @@ const state: UiState = {
   modes: [],
   running: false,
   commands: [],
+  fallback: "",
 };
 
 let currentAssistant: { el: HTMLElement; raw: string } | null = null;
+/** The live collapsible "thinking" block for the current step, if any. */
+let currentReasoning: { details: HTMLDetailsElement; body: HTMLElement; raw: string } | null = null;
+/** Model driving the current turn — stamped onto each assistant block as a badge. */
+let currentTurnModel = "";
 
 // Thinking state machine
 let thinkStart = 0;
@@ -66,6 +74,10 @@ let checkpointTurns = 0;
 let checkpointFiles = 0;
 /** Completed turns this session — gates the retry/edit chips. */
 let turnsCompleted = 0;
+/** Rewindable turn-start points from the host: rewindId → restorable file count.
+ * `rewindLoaded` guards against disabling buttons before the first state arrives. */
+let rewindPoints = new Map<number, number>();
+let rewindLoaded = false;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 // Re-render the meter periodically so the warmth dot flips to cold on its own.
 setInterval(() => {
@@ -210,9 +222,8 @@ function toggleActionsMenu() {
   const hasEdits = checkpointTurns > 0;
   const hasTurns = turnsCompleted > 0;
   item("±", "Review & commit changes", hasEdits ? `Diff the last turn's ${checkpointFiles} file(s), commit with one click` : "No edits from the last turn", hasEdits, { type: "getTurnDiff" });
-  item("↩", "Revert last turn's edits", hasEdits ? `Restore ${checkpointFiles} file(s) (${checkpointTurns} turn(s) revertible)` : "No edits to revert", hasEdits, { type: "revertTurn" });
-  item("↻", "Retry last message", hasTurns ? "Roll back and re-send your last message" : "Nothing to retry yet", hasTurns, { type: "retryTurn" });
-  item("✎", "Edit last message", hasTurns ? "Roll back and edit before re-sending" : "Nothing to edit yet", hasTurns, { type: "editLastTurn" });
+  item("↻", "Retry last message", hasTurns ? "Rewind the last turn (restores its files) and re-send" : "Nothing to retry yet", hasTurns, { type: "retryTurn" });
+  item("✎", "Edit last message", hasTurns ? "Rewind the last turn (restores its files) and edit before re-sending" : "Nothing to edit yet", hasTurns, { type: "editLastTurn" });
   item("◔", "Context inspector", "What's in the context window and what the next call costs", true, { type: "getContextInfo" });
   item("⬇", "Export session", "Open this conversation as a Markdown document", hasTurns, { type: "exportSession" });
   actionsMenuEl.classList.remove("hidden");
@@ -256,6 +267,42 @@ sendBtn.addEventListener("click", () => {
   else send();
 });
 
+/** Cycle Standard → Auto → Plan → Standard. */
+function cycleMode() {
+  if (!state.modes.length) return;
+  const i = state.modes.findIndex((m) => m.id === state.mode);
+  const next = state.modes[(i + 1) % state.modes.length];
+  post({ type: "setMode", mode: next.id as any });
+}
+
+// Global shortcuts (fire regardless of which webview element has focus).
+document.addEventListener("keydown", (e) => {
+  // Ctrl/Cmd+. cycles the agent mode.
+  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === ".") {
+    e.preventDefault();
+    cycleMode();
+    return;
+  }
+  // Esc stops a running turn (unless a dropdown/overlay owns Escape).
+  if (
+    e.key === "Escape" &&
+    state.running &&
+    !mentionActive &&
+    overlayEl.classList.contains("hidden") &&
+    actionsMenuEl.classList.contains("hidden")
+  ) {
+    e.preventDefault();
+    post({ type: "cancel" });
+    return;
+  }
+  // Ctrl/Cmd+Shift+Backspace starts a fresh session.
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === "Backspace") {
+    e.preventDefault();
+    post({ type: "newSession" });
+    return;
+  }
+});
+
 function autosize() {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
@@ -288,10 +335,29 @@ function setRunning(running: boolean) {
 // Stick-to-bottom: only auto-scroll while the user is already near the bottom.
 // Scrolling up to read pauses following; scrolling back down resumes it.
 let stickToBottom = true;
+function nearBottom(): boolean {
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 60;
+}
 messagesEl.addEventListener("scroll", () => {
-  stickToBottom =
-    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 60;
+  stickToBottom = nearBottom();
 });
+// The scroll event above is async, so during rapid streaming a scrollToBottom()
+// can snap back before it registers a scroll-up. Wheel/touch fire synchronously
+// with the user's intent, so release stick immediately when they scroll up.
+messagesEl.addEventListener(
+  "wheel",
+  (e: WheelEvent) => {
+    if (e.deltaY < 0) stickToBottom = false;
+  },
+  { passive: true }
+);
+messagesEl.addEventListener(
+  "touchmove",
+  () => {
+    stickToBottom = nearBottom();
+  },
+  { passive: true }
+);
 function scrollToBottom(force = false) {
   if (!force && !stickToBottom) return;
   if (force) stickToBottom = true;
@@ -299,17 +365,127 @@ function scrollToBottom(force = false) {
 }
 
 // ---------- Messages ----------
-function addUserMessage(text: string, queued?: boolean) {
+function addUserMessage(
+  text: string,
+  opts?: { queued?: boolean; echoId?: number; rewindId?: number }
+) {
+  clearWelcome();
   const wrap = el("div", "msg user enter");
   const bubble = el("div", "bubble");
   bubble.innerHTML = renderMarkdown(text);
-  if (queued) {
+  if (opts?.queued) {
     wrap.classList.add("queued");
     bubble.appendChild(el("span", "queued-tag", "Queued"));
   }
   wrap.appendChild(bubble);
+  if (opts?.echoId !== undefined) wrap.dataset.echoId = String(opts.echoId);
+  if (opts?.rewindId !== undefined) attachRewindButton(wrap, opts.rewindId);
   messagesEl.appendChild(wrap);
   scrollToBottom(true); // the user's own message always snaps down
+}
+
+// ---------- Rewind (per-message) ----------
+/** Attach the hover-revealed rewind button to a turn-start user bubble. */
+function attachRewindButton(wrap: HTMLElement, rewindId: number) {
+  wrap.dataset.rewindId = String(rewindId);
+  if (wrap.querySelector(".rewind-btn")) return;
+  const btn = el("button", "rewind-btn", "⟲");
+  btn.onclick = () => {
+    if (btn.classList.contains("disabled")) return;
+    post({ type: "rewindPreview", id: rewindId });
+  };
+  wrap.appendChild(btn);
+  refreshRewindButton(wrap);
+}
+
+/** Enable/disable + tooltip a bubble's rewind button from the current state. */
+function refreshRewindButton(wrap: HTMLElement) {
+  const idStr = wrap.dataset.rewindId;
+  const btn = wrap.querySelector(".rewind-btn") as HTMLButtonElement | null;
+  if (!btn || idStr === undefined) return;
+  const files = rewindPoints.get(Number(idStr));
+  if (rewindLoaded && files === undefined) {
+    // Compacted out of the live context — no longer rewindable.
+    btn.classList.add("disabled");
+    btn.classList.remove("has-edits");
+    btn.title = "This point was summarized away and can no longer be rewound";
+  } else {
+    btn.classList.remove("disabled");
+    // Mark turns that changed files so restore points are visible inline.
+    btn.classList.toggle("has-edits", !!files);
+    btn.title = files
+      ? `Rewind here — restores ${files} file(s), discards everything below`
+      : "Rewind here — discards everything below";
+  }
+}
+
+function applyRewindState() {
+  messagesEl
+    .querySelectorAll<HTMLElement>(".msg.user[data-rewind-id]")
+    .forEach(refreshRewindButton);
+}
+
+/** Truncate the transcript DOM from the bubble with this rewindId onward. */
+function rollbackDomFrom(rewindId: number) {
+  const target = messagesEl.querySelector<HTMLElement>(
+    `.msg.user[data-rewind-id="${rewindId}"]`
+  );
+  if (!target) return;
+  let node: Element | null = target;
+  const toRemove: Element[] = [];
+  while (node) {
+    toRemove.push(node);
+    node = node.nextElementSibling;
+  }
+  toRemove.forEach((n) => n.remove());
+  currentAssistant = null;
+  currentReasoning = null;
+  turnsCompleted = messagesEl.querySelectorAll(".msg.user[data-rewind-id]").length;
+  updateMeter();
+}
+
+/** Destructive-rewind confirmation, reusing the sheet + approval-button styles. */
+function showRewindConfirm(p: Extract<HostToWebview, { type: "rewindPreview" }>) {
+  const sheet = openSheet();
+  sheetHead(sheet, "Rewind conversation");
+  const body = el("div", "rewind-confirm");
+  const preview = (p.text || "").replace(/\s+/g, " ").slice(0, 140);
+  body.appendChild(el("div", "rewind-target", preview ? `“${preview}”` : "this message"));
+  const summary = [`Discards ${p.messagesDiscarded} message(s) and everything after`];
+  if (p.filesRestored) summary.push(`restores ${p.filesRestored} file(s)`);
+  if (p.filesDeleted) summary.push(`deletes ${p.filesDeleted} created file(s)`);
+  body.appendChild(el("div", "rewind-summary", summary.join(" · ") + "."));
+  const warn = ["Command side effects (installs, deletes, git) are not undone."];
+  if (p.horizonExceeded)
+    warn.push("Some older edits are past the checkpoint horizon and can't be restored.");
+  body.appendChild(el("div", "rewind-warn", warn.join(" ")));
+  const actions = el("div", "approval-actions");
+  const cancel = el("button", "btn btn-reject", "Cancel");
+  const rollback = el("button", "btn btn-approve", "Rewind");
+  rollback.title = "Restore files and trim the conversation to here, then stop";
+  const edit = el("button", "btn btn-always", "Rewind & edit");
+  edit.title = "Rewind, then put this message back in the composer to change it";
+  const rerun = el("button", "btn btn-always", "Rewind & re-run");
+  rerun.title = "Rewind, then re-send this message as-is";
+  cancel.onclick = hideOverlay;
+  rollback.onclick = () => {
+    hideOverlay();
+    post({ type: "rewindTo", id: p.id, mode: "rollback" });
+  };
+  edit.onclick = () => {
+    hideOverlay();
+    post({ type: "rewindTo", id: p.id, mode: "edit" });
+  };
+  rerun.onclick = () => {
+    hideOverlay();
+    post({ type: "rewindTo", id: p.id, mode: "rerun" });
+  };
+  actions.appendChild(cancel);
+  actions.appendChild(rollback);
+  actions.appendChild(edit);
+  actions.appendChild(rerun);
+  body.appendChild(actions);
+  sheet.appendChild(body);
 }
 function clearQueuedTags() {
   messagesEl.querySelectorAll(".msg.user.queued").forEach((m) => {
@@ -320,7 +496,13 @@ function clearQueuedTags() {
 
 function ensureAssistant(): { el: HTMLElement; raw: string } {
   if (!currentAssistant) {
+    clearWelcome();
     const wrap = el("div", "msg assistant enter");
+    if (currentTurnModel) {
+      const badge = el("span", "model-badge", currentTurnModel.split("/").pop() || currentTurnModel);
+      badge.title = `Answered by ${currentTurnModel}`;
+      wrap.appendChild(badge);
+    }
     const body = el("div", "assistant-body");
     wrap.appendChild(body);
     messagesEl.appendChild(wrap);
@@ -437,12 +619,45 @@ function startThink() {
 function finishThink() {
   if (!thinking) return;
   thinking = false;
-  const secs = Math.round((Date.now() - thinkStart) / 1000);
-  if (sawReasoning || secs >= 3) {
-    const shown = Math.max(1, secs);
-    messagesEl.appendChild(el("div", "thought-line", `Thought for ${shown}s`));
+  const secs = Math.max(1, Math.round((Date.now() - thinkStart) / 1000));
+  if (currentReasoning) {
+    // We streamed the actual reasoning — fold the duration into its summary
+    // and collapse it, instead of a separate "Thought for Ns" line.
+    finalizeReasoning(secs);
+  } else if (sawReasoning || secs >= 3) {
+    messagesEl.appendChild(el("div", "thought-line", `Thought for ${secs}s`));
     scrollToBottom();
   }
+}
+
+// ---------- Reasoning (collapsible "thinking") ----------
+function ensureReasoning(): { details: HTMLDetailsElement; body: HTMLElement; raw: string } {
+  if (!currentReasoning) {
+    const details = el("details", "reasoning") as HTMLDetailsElement;
+    details.open = false; // collapsed by default; expand the summary to watch it stream
+    const summary = el("summary", undefined, "Thinking…");
+    const body = el("div", "reasoning-body");
+    details.appendChild(summary);
+    details.appendChild(body);
+    messagesEl.appendChild(details);
+    currentReasoning = { details, body, raw: "" };
+  }
+  return currentReasoning;
+}
+function appendReasoning(delta: string) {
+  const r = ensureReasoning();
+  r.raw += delta;
+  r.body.textContent = r.raw;
+  // Collapsed thinking isn't visible, so don't fight the user's scroll position.
+  if (r.details.open) scrollToBottom();
+}
+/** Collapse the current reasoning block and label it with the think duration. */
+function finalizeReasoning(secs?: number) {
+  if (!currentReasoning) return;
+  const summary = currentReasoning.details.querySelector("summary");
+  if (summary) summary.textContent = secs ? `Thought for ${secs}s` : "Thoughts";
+  currentReasoning.details.open = false;
+  currentReasoning = null;
 }
 function shortTarget(s: string): string {
   return s.length > 48 ? s.slice(0, 47) + "…" : s;
@@ -631,17 +846,22 @@ function renderDiffPreview(diff: DiffData): HTMLElement {
     0,
     PREVIEW_ROWS
   );
-  const totalLines = diff.rows.filter((r) => r.gap === undefined).length;
 
-  const root = el("div", "diff diff-preview");
-  root.title = "Click to view the full diff";
+  // Expand only when there are changed rows the preview doesn't show (or the
+  // diff was row-capped). We deliberately DON'T print a hidden-line count: a
+  // side-by-side row can represent one or two changed lines (a paired
+  // modification vs. a lone add/del), so any single number is misleading and
+  // swings with how edits happen to align. The header's +adds/−dels covers scale.
+  const expandable = changed.length > shown.length || !!diff.truncated;
+
+  const root = el("div", "diff diff-preview" + (expandable ? " expandable" : ""));
   root.appendChild(diffHead(diff, isNewFileDiff(diff) ? "new file" : undefined));
   root.appendChild(diffBody(diff, shown));
-  const more = totalLines - shown.length;
-  root.appendChild(
-    el("div", "diff-more", more > 0 ? `+${more} more line${more === 1 ? "" : "s"} — click to expand` : "click to expand")
-  );
-  root.onclick = () => showDiffSheet(diff);
+  if (expandable) {
+    root.title = "Click to view the full diff";
+    root.appendChild(el("div", "diff-more", "click to expand"));
+    root.onclick = () => showDiffSheet(diff);
+  }
   return root;
 }
 
@@ -716,6 +936,20 @@ function addError(message: string) {
   const e = el("div", "error-line enter");
   e.appendChild(el("span", "error-badge", "Error"));
   e.appendChild(el("span", undefined, message));
+  // Offer recovery actions when there's a turn to retry.
+  if (turnsCompleted > 0) {
+    const actions = el("div", "error-actions");
+    const retry = el("button", "review-act", "Retry");
+    retry.onclick = () => post({ type: "retryTurn" });
+    actions.appendChild(retry);
+    if (state.fallback && state.fallback !== state.model) {
+      const fb = el("button", "review-act", `Retry with ${state.fallback.split("/").pop()}`);
+      fb.title = `Switch to ${state.fallback} and retry`;
+      fb.onclick = () => post({ type: "retryWithModel", model: state.fallback });
+      actions.appendChild(fb);
+    }
+    e.appendChild(actions);
+  }
   messagesEl.appendChild(e);
   scrollToBottom();
 }
@@ -1235,6 +1469,13 @@ function showSettings(s: SettingsPayload) {
       listSetting("fallbackModels", s.fallbackModels)
     )
   );
+  models.appendChild(
+    setRow(
+      "Favorite models",
+      "One per line. When set, these are shown first in the model quick-pick (⌘/Ctrl-click the model chip, or the model command).",
+      listSetting("favoriteModels", s.favoriteModels)
+    )
+  );
   body.appendChild(models);
 
   // --- Context & cost ---
@@ -1293,6 +1534,20 @@ function showSettings(s: SettingsPayload) {
   const beh = setGroup("Agent Behavior");
   beh.appendChild(
     setRow(
+      "Max turns per task",
+      "Tool-loop steps the agent runs before stopping. Raise it so long tasks and plans (esp. Auto mode) finish without stalling. 0 = unlimited.",
+      numberSetting("maxTurns", s.maxTurns, { min: 0, step: 10 })
+    )
+  );
+  beh.appendChild(
+    setRow(
+      "Loop guard",
+      "Stop the turn if the model rewrites the same file (or re-runs the same command) more than this many times — catches runaway second-guessing loops. 0 = disabled.",
+      numberSetting("loopGuardLimit", s.loopGuardLimit, { min: 0, step: 1 })
+    )
+  );
+  beh.appendChild(
+    setRow(
       "Include active file",
       "Attach the file (and selection) you're looking at to each message.",
       toggleSetting("includeActiveFile", s.includeActiveFile)
@@ -1303,6 +1558,13 @@ function showSettings(s: SettingsPayload) {
       "Format after edit",
       "Run the workspace formatter on files the agent edits.",
       toggleSetting("formatAfterEdit", s.formatAfterEdit)
+    )
+  );
+  beh.appendChild(
+    setRow(
+      "Reveal edited files",
+      "Open each file the agent edits in a preview tab (focus stays in the chat). Off = don't open files as they're written.",
+      toggleSetting("revealEditedFiles", s.revealEditedFiles)
     )
   );
   beh.appendChild(
@@ -1341,6 +1603,19 @@ function showSettings(s: SettingsPayload) {
       "Temperature",
       "0 is best for deterministic agentic coding.",
       numberSetting("temperature", s.temperature, { min: 0, max: 2, step: 0.1 })
+    )
+  );
+  gen.appendChild(
+    setRow(
+      "Thinking effort",
+      "Reasoning budget for models that support it. Higher = more deliberate (and pricier); Off disables thinking. Default uses the model's own setting.",
+      selectSetting("reasoningEffort", s.reasoningEffort, [
+        { value: "default", label: "Default — the model's own setting" },
+        { value: "off", label: "Off — no reasoning" },
+        { value: "low", label: "Low" },
+        { value: "medium", label: "Medium" },
+        { value: "high", label: "High" },
+      ])
     )
   );
   gen.appendChild(
@@ -1385,6 +1660,13 @@ function showSettings(s: SettingsPayload) {
         { value: "price", label: "Price — cheapest provider" },
         { value: "default", label: "Default — load-balanced" },
       ])
+    )
+  );
+  priv.appendChild(
+    setRow(
+      "Quantizations",
+      "One per line (e.g. fp8, fp16, bf16). When set, only providers serving the model at these precisions are used — leave empty for any, or list fp8+ to avoid low-precision (fp4) routing.",
+      listSetting("quantizations", s.quantizations)
     )
   );
   body.appendChild(priv);
@@ -1517,13 +1799,66 @@ function showTurnDiff(diffs: DiffData[]) {
   if (!diffs.length) {
     body.appendChild(el("div", "sheet-empty", "No file changes recorded for the last turn."));
   }
-  for (const d of diffs) {
-    // renderDiff's own header already carries the path and +/− stats.
-    const block = el("div", "chart-block");
-    block.appendChild(renderDiff(d, false));
-    body.appendChild(block);
-  }
+  for (const d of diffs) body.appendChild(renderReviewFile(d));
   sheet.appendChild(body);
+}
+
+/** A reviewed file: full diff + per-file actions (open editor diff, revert) and,
+ * when it has multiple change blocks, per-hunk revert checkboxes. */
+function renderReviewFile(d: DiffData): HTMLElement {
+  const block = el("div", "chart-block review-file");
+
+  const head = el("div", "review-head");
+  head.appendChild(el("span", "diff-path", d.path));
+  const stat = el("span", "diff-stat");
+  if (isNewFileDiff(d)) stat.appendChild(el("span", "diff-tag", "new file"));
+  if (d.addCount) stat.appendChild(el("span", "stat-add", `+${d.addCount}`));
+  if (d.delCount) stat.appendChild(el("span", "stat-del", `−${d.delCount}`));
+  head.appendChild(stat);
+  const actions = el("div", "review-actions");
+  const openBtn = el("button", "review-act", "Open diff");
+  openBtn.title = "Open a side-by-side diff in the editor";
+  openBtn.onclick = () => post({ type: "openDiff", path: d.path });
+  const revertBtn = el("button", "review-act danger", "Revert file");
+  revertBtn.title = "Restore this file to its state before the last turn";
+  revertBtn.onclick = () => post({ type: "revertFile", path: d.path });
+  actions.appendChild(openBtn);
+  actions.appendChild(revertBtn);
+  head.appendChild(actions);
+  block.appendChild(head);
+
+  block.appendChild(diffBody(d, d.rows));
+  if (d.truncated) block.appendChild(el("div", "diff-trunc", "… diff truncated"));
+
+  // Per-hunk revert (only meaningful when there's more than one change block).
+  const hunkIds = [...new Set(d.rows.filter((r) => r.hunk !== undefined).map((r) => r.hunk!))];
+  if (hunkIds.length > 1) {
+    const bar = el("div", "review-hunks");
+    const checked = new Set<number>();
+    const revertSel = el("button", "review-act danger", "Revert selected hunks") as HTMLButtonElement;
+    revertSel.disabled = true;
+    hunkIds.forEach((h, idx) => {
+      const label = el("label", "review-hunk-chk");
+      const cb = el("input") as HTMLInputElement;
+      cb.type = "checkbox";
+      cb.onchange = () => {
+        cb.checked ? checked.add(h) : checked.delete(h);
+        revertSel.disabled = checked.size === 0;
+      };
+      const first = d.rows.find((r) => r.hunk === h);
+      const preview = (first?.right?.text ?? first?.left?.text ?? "").trim().slice(0, 50);
+      if (preview) label.title = preview;
+      label.appendChild(cb);
+      label.appendChild(el("span", "review-hunk-label", `Hunk ${idx + 1}`));
+      bar.appendChild(label);
+    });
+    revertSel.onclick = () => {
+      if (checked.size) post({ type: "revertHunks", path: d.path, hunks: [...checked] });
+    };
+    bar.appendChild(revertSel);
+    block.appendChild(bar);
+  }
+  return block;
 }
 
 // ---------- Overlay: context inspector ----------
@@ -1582,18 +1917,32 @@ function rollbackDom() {
   }
   toRemove.forEach((n) => n.remove());
   currentAssistant = null;
+  currentReasoning = null;
   turnsCompleted = Math.max(0, turnsCompleted - 1);
   updateMeter();
 }
 
-// ---------- @-file mentions ----------
+// ---------- @-mentions (files, folders, symbols, problems, git) + / commands ----------
+type MentionRow = {
+  label: string;
+  insert?: string;
+  detail?: string;
+  resolve?: { kind: string; arg?: string };
+};
 let mentionToken = 0;
 let mentionActive = false;
-let mentionItems: string[] = [];
+let mentionItems: MentionRow[] = [];
 let mentionSel = 0;
 let mentionStart = -1; // index of "@" (file mode) — command mode inserts at 0
 let mentionMode: "file" | "command" = "file";
 let mentionTimer: ReturnType<typeof setTimeout> | undefined;
+
+function mentionRowFromItem(it: MentionItem): MentionRow {
+  if (it.kind === "problems" || it.kind === "git") {
+    return { label: "@" + it.label, detail: it.detail, resolve: { kind: it.kind, arg: it.arg } };
+  }
+  return { label: it.label, insert: it.insert ?? it.label, detail: it.detail };
+}
 
 function updateMention() {
   const caret = inputEl.selectionStart ?? inputEl.value.length;
@@ -1606,7 +1955,9 @@ function updateMention() {
     mentionStart = 0;
     const q = cmd[1].toLowerCase();
     renderMention(
-      state.commands.filter((c) => c.toLowerCase().startsWith(q)).map((c) => "/" + c)
+      state.commands
+        .filter((c) => c.toLowerCase().startsWith(q))
+        .map((c) => ({ label: "/" + c, insert: "/" + c }))
     );
     return;
   }
@@ -1621,7 +1972,7 @@ function updateMention() {
   const query = m[2];
   clearTimeout(mentionTimer);
   mentionTimer = setTimeout(() => {
-    post({ type: "queryFiles", query, token: ++mentionToken });
+    post({ type: "queryMentions", query, token: ++mentionToken });
   }, 120);
 }
 
@@ -1631,18 +1982,20 @@ function closeMention() {
   mentionEl.innerHTML = "";
 }
 
-function renderMention(files: string[]) {
-  mentionItems = files;
+function renderMention(rows: MentionRow[]) {
+  mentionItems = rows;
   mentionSel = 0;
-  if (!files.length) {
+  if (!rows.length) {
     closeMention();
     return;
   }
   mentionActive = true;
   mentionEl.classList.remove("hidden");
   mentionEl.innerHTML = "";
-  files.forEach((f, i) => {
-    const row = el("div", "mention-item" + (i === mentionSel ? " sel" : ""), f);
+  rows.forEach((r, i) => {
+    const row = el("div", "mention-item" + (i === mentionSel ? " sel" : ""));
+    row.appendChild(el("span", "mention-label", r.label));
+    if (r.detail) row.appendChild(el("span", "mention-detail", r.detail));
     // mousedown (not click) so the textarea doesn't lose focus first.
     row.addEventListener("mousedown", (e) => {
       e.preventDefault();
@@ -1665,10 +2018,18 @@ function pickMention(i: number) {
   const item = mentionItems[i];
   if (item === undefined || mentionStart < 0) return;
   const caret = inputEl.selectionStart ?? inputEl.value.length;
-  // Command mode items already include the slash and replace from position 0.
-  inputEl.value = inputEl.value.slice(0, mentionStart) + item + " " + inputEl.value.slice(caret);
-  const pos = mentionStart + item.length + 1;
-  inputEl.setSelectionRange(pos, pos);
+  if (item.resolve) {
+    // Host-resolved context (problems/git): drop the @token; the resolved text
+    // is attached to the next message host-side.
+    inputEl.value = inputEl.value.slice(0, mentionStart) + inputEl.value.slice(caret);
+    inputEl.setSelectionRange(mentionStart, mentionStart);
+    post({ type: "resolveMention", kind: item.resolve.kind, arg: item.resolve.arg });
+  } else {
+    const insert = item.insert ?? item.label;
+    inputEl.value = inputEl.value.slice(0, mentionStart) + insert + " " + inputEl.value.slice(caret);
+    const pos = mentionStart + insert.length + 1;
+    inputEl.setSelectionRange(pos, pos);
+  }
   closeMention();
   autosize();
   inputEl.focus();
@@ -1702,30 +2063,73 @@ function renderAttachments() {
   });
 }
 
+function addImageFile(file: File) {
+  if (pendingImages.length >= MAX_IMAGES) {
+    addStatus(`Up to ${MAX_IMAGES} images per message.`);
+    return;
+  }
+  if (!file.type.startsWith("image/")) {
+    addStatus("Only image files can be attached.");
+    return;
+  }
+  if (file.size > MAX_IMAGE_BYTES) {
+    addStatus("Image too large (max 3 MB). Resize and try again.");
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    pendingImages.push(String(reader.result));
+    renderAttachments();
+  };
+  reader.readAsDataURL(file);
+}
+
 inputEl.addEventListener("paste", (e: ClipboardEvent) => {
   const items = e.clipboardData?.items;
   if (!items) return;
   for (const item of Array.from(items)) {
     if (!item.type.startsWith("image/")) continue;
     e.preventDefault();
-    if (pendingImages.length >= MAX_IMAGES) {
-      addStatus(`Up to ${MAX_IMAGES} images per message.`);
-      return;
-    }
     const file = item.getAsFile();
-    if (!file) continue;
-    if (file.size > MAX_IMAGE_BYTES) {
-      addStatus("Image too large (max 3 MB). Resize and paste again.");
-      continue;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      pendingImages.push(String(reader.result));
-      renderAttachments();
-    };
-    reader.readAsDataURL(file);
+    if (file) addImageFile(file);
   }
 });
+
+// Drag & drop images onto the composer.
+const inputShell = document.querySelector(".input-shell") as HTMLElement | null;
+if (inputShell) {
+  inputShell.addEventListener("dragover", (e: DragEvent) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.items).some((i) => i.kind === "file")) {
+      e.preventDefault();
+      inputShell.classList.add("drag-over");
+    }
+  });
+  inputShell.addEventListener("dragleave", () => inputShell.classList.remove("drag-over"));
+  inputShell.addEventListener("drop", (e: DragEvent) => {
+    const files = e.dataTransfer?.files;
+    inputShell.classList.remove("drag-over");
+    if (!files || !files.length) return;
+    e.preventDefault();
+    for (const f of Array.from(files)) addImageFile(f);
+  });
+}
+
+// Attach-image button + hidden file picker.
+const imgPicker = el("input") as HTMLInputElement;
+imgPicker.type = "file";
+imgPicker.accept = "image/*";
+imgPicker.multiple = true;
+imgPicker.style.display = "none";
+imgPicker.onchange = () => {
+  if (imgPicker.files) for (const f of Array.from(imgPicker.files)) addImageFile(f);
+  imgPicker.value = "";
+};
+document.body.appendChild(imgPicker);
+const attachBtn = el("button", "attach-btn", "📎");
+attachBtn.title = "Attach image";
+attachBtn.onclick = () => imgPicker.click();
+const composerBar = document.querySelector(".composer-bar");
+if (composerBar) composerBar.insertBefore(attachBtn, composerBar.firstChild);
 
 // ---------- Meter ----------
 function updateMeter() {
@@ -1791,6 +2195,45 @@ function renderApiKeyNotice() {
   messagesEl.appendChild(wrap);
 }
 
+function clearWelcome() {
+  messagesEl.querySelector(".welcome")?.remove();
+}
+
+/** First-run / empty-session onboarding: modes, tips, and quick actions. */
+function renderWelcome() {
+  if (messagesEl.querySelector(".welcome")) return;
+  const wrap = el("div", "welcome enter");
+  const modes = state.modes.map((m) => `<li><b>${m.label}</b> — ${m.description}</li>`).join("");
+  wrap.innerHTML = `
+    <div class="welcome-logo"></div>
+    <h2>Luna Code is ready</h2>
+    <p>Ask it to build, fix, or explain anything in this workspace.</p>
+    ${modes ? `<ul class="welcome-modes">${modes}</ul>` : ""}
+    <p class="welcome-tips"><b>@</b> adds files, folders, symbols, problems, or the git diff · <b>/</b> runs commands · <b>⌘/Ctrl&nbsp;.</b> cycles mode</p>
+  `;
+  const row = el("div", "welcome-actions");
+  const mem = el("button", "btn", "Create LUNA.md");
+  mem.title = "Create a project-memory file Luna reads every turn";
+  mem.onclick = () => post({ type: "createMemory" });
+  const model = el("button", "btn", `Model: ${state.model.split("/").pop() || "choose"}`);
+  model.onclick = () => post({ type: "selectModel" });
+  row.appendChild(mem);
+  row.appendChild(model);
+  wrap.appendChild(row);
+  const chips = el("div", "welcome-examples");
+  ["Explain this codebase", "Find and fix a bug", "Add tests"].forEach((ex) => {
+    const c = el("button", "welcome-chip", ex);
+    c.onclick = () => {
+      inputEl.value = ex + " ";
+      autosize();
+      inputEl.focus();
+    };
+    chips.appendChild(c);
+  });
+  wrap.appendChild(chips);
+  messagesEl.appendChild(wrap);
+}
+
 // ---------- Message handling ----------
 window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
   const msg = event.data;
@@ -1801,12 +2244,15 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       state.mode = msg.mode;
       state.modes = msg.modes;
       state.commands = msg.commands ?? [];
+      state.fallback = msg.fallback ?? "";
       renderModeBar();
       renderModel();
       updateMeter();
       if (!msg.hasApiKey) {
         messagesEl.innerHTML = "";
         renderApiKeyNotice();
+      } else if (!messagesEl.querySelector(".msg")) {
+        renderWelcome();
       }
       break;
     case "config":
@@ -1814,10 +2260,13 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       state.model = msg.model;
       state.mode = msg.mode;
       state.commands = msg.commands ?? state.commands;
+      state.fallback = msg.fallback ?? state.fallback;
       renderModel();
       renderModeBar();
       if (state.hasApiKey && messagesEl.querySelector(".welcome")) {
+        // API key was just added — swap the key notice for the onboarding card.
         messagesEl.innerHTML = "";
+        renderWelcome();
       } else if (!state.hasApiKey && !messagesEl.querySelector(".welcome")) {
         messagesEl.innerHTML = "";
         renderApiKeyNotice();
@@ -1826,6 +2275,7 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
     case "sessionReset":
       messagesEl.innerHTML = "";
       currentAssistant = null;
+      currentReasoning = null;
       thinking = false;
       setRunning(false);
       hideActivity();
@@ -1837,16 +2287,18 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       closeMention();
       updateMeter();
       if (!state.hasApiKey) renderApiKeyNotice();
+      else renderWelcome();
       break;
     case "userEcho":
       // A queued message arrives mid-stream — don't disturb the assistant block
       // currently streaming; just append it below with a Queued tag.
       if (!msg.queued) currentAssistant = null;
-      addUserMessage(msg.text, msg.queued);
+      addUserMessage(msg.text, { queued: msg.queued, echoId: msg.echoId, rewindId: msg.rewindId });
       break;
     case "turnStart":
       setRunning(true);
       currentAssistant = null;
+      currentTurnModel = msg.model || state.model;
       clearQueuedTags();
       thinkCountEl.textContent = "";
       // A finished plan is stale clutter on the next turn — clear it. An
@@ -1870,6 +2322,8 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       break;
     case "reasoning":
       sawReasoning = true;
+      // Only render live (during a real turn); replays don't carry reasoning.
+      if (state.running) appendReasoning(msg.delta);
       break;
     case "toolStart": {
       if (state.running) {
@@ -1890,6 +2344,9 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       break;
     case "status":
       addStatus(msg.message);
+      break;
+    case "steeringApplied":
+      clearQueuedTags();
       break;
     case "usage":
       lastTurnUsage = msg.usage;
@@ -1923,11 +2380,29 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
     case "contextInfo":
       showContextInfo(msg.info);
       break;
-    case "fileMatches":
-      if (msg.token === mentionToken) renderMention(msg.files);
+    case "mentionMatches":
+      if (msg.token === mentionToken) renderMention(msg.items.map(mentionRowFromItem));
       break;
     case "rollback":
       rollbackDom();
+      break;
+    case "rewindAssign": {
+      const wrap = messagesEl.querySelector<HTMLElement>(
+        `.msg.user[data-echo-id="${msg.echoId}"]`
+      );
+      if (wrap) attachRewindButton(wrap, msg.rewindId);
+      break;
+    }
+    case "rewindState":
+      rewindPoints = new Map(msg.points.map((p) => [p.id, p.files]));
+      rewindLoaded = true;
+      applyRewindState();
+      break;
+    case "rewindPreview":
+      showRewindConfirm(msg);
+      break;
+    case "rewound":
+      rollbackDomFrom(msg.id);
       break;
     case "composerFill":
       inputEl.value = msg.text;
@@ -1946,11 +2421,14 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       break;
     case "error":
       thinking = false;
+      finalizeReasoning();
       hideActivity();
       addError(msg.message);
       break;
-    case "turnEnd":
+    case "turnEnd": {
+      const secs = thinking ? Math.max(1, Math.round((Date.now() - thinkStart) / 1000)) : undefined;
       thinking = false;
+      finalizeReasoning(secs);
       hideActivity();
       setRunning(false);
       currentAssistant = null;
@@ -1959,6 +2437,7 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       markClippedCode(messagesEl);
       updateMeter();
       break;
+    }
     case "approvalRequest":
       showApproval(msg.payload);
       break;

@@ -6,7 +6,8 @@ import { execFile } from "child_process";
 import { HostToWebview, WebviewToHost } from "./protocol";
 import { Agent } from "../agent/agent";
 import { ContextManager, estimateTokens } from "../agent/contextManager";
-import { computeDiff } from "../diff";
+import { collapseRestoreSet } from "../agent/checkpoints";
+import { computeDiff, reconstructWithReverts } from "../diff";
 import { buildSystemPrompt } from "../agent/systemPrompt";
 import { OpenRouterClient } from "../openrouter/client";
 import { getConfig, SecretStore } from "../config";
@@ -17,11 +18,13 @@ import { toolsForMode, toToolDefinitions } from "../agent/tools";
 import { SessionStore, StoredSession, deriveTitle } from "../sessions";
 import { AssistantMessage, ChatMessage } from "../openrouter/types";
 import { UsageStore } from "../usage";
-import { SessionUsage, SettingsPayload } from "./protocol";
+import { SessionUsage, SettingsPayload, MentionItem } from "./protocol";
 import { McpManager } from "../mcp/manager";
 import { disposeAllProcesses } from "../agent/tools/backgroundProcess";
 
-/** Built-in slash commands (custom ones come from lunacode.customCommands). */
+/** Built-in slash commands. Templates may use $ARGUMENTS (all extra text) and
+ * $1..$9 (positional). Custom ones come from lunacode.customCommands and project
+ * .luna/commands/*.md files. */
 const SLASH_COMMANDS: Record<string, string> = {
   commit:
     "Look at the current git status and diff, stage the appropriate files, and create a commit with a well-written conventional commit message. Show the final commit.",
@@ -29,6 +32,13 @@ const SLASH_COMMANDS: Record<string, string> = {
     "Review the current working tree changes (git diff plus git diff --staged). Report findings ordered by severity — bugs, then risks, then style — with specific file:line references. Do not change any files.",
   tests:
     "Run the project's test suite, analyze any failures, fix them, and re-run until everything passes.",
+  pr: "Summarize the changes on the current branch versus the default branch (use git), then draft a pull request title and description (what changed, why, and how to test). Do not push or open the PR unless asked.",
+  fix: "Investigate and fix the following issue, then verify the fix: $ARGUMENTS",
+  explain:
+    "Explain how the following code or concept works, concisely and with references to the relevant files: $ARGUMENTS",
+  doc: "Add or improve documentation (comments/README/docstrings) for the following, matching the project's existing style: $ARGUMENTS",
+  optimize:
+    "Profile or reason about the performance of the following and propose the smallest change that meaningfully improves it, then apply it: $ARGUMENTS",
 };
 
 function execGit(cwd: string, args: string[]): Promise<string> {
@@ -55,8 +65,12 @@ export class LunaCodeController {
   private approvalSeq = 0;
   private sessionApprovedKinds = new Set<string>();
   private pendingSelections: string[] = [];
-  /** User messages waiting to run (queued while a turn is active). */
-  private queue: Array<{ text: string; images?: string[] }> = [];
+  /** User messages waiting to run (queued while a turn is active). `echoId` ties
+   * a queued message back to its transcript bubble so the rewind button can be
+   * attached to it once the turn actually starts. */
+  private queue: Array<{ text: string; images?: string[]; echoId?: number }> = [];
+  /** Monotonic id for user-message bubbles (rewind bubble handle). */
+  private echoSeq = 0;
 
   private webviews = new Set<vscode.Webview>();
   private transcript: HostToWebview[] = [];
@@ -76,9 +90,17 @@ export class LunaCodeController {
   private modelMetaPromise: Promise<void> | null = null;
   private modelMetaFetchedAt = 0;
 
-  /** Per-turn file checkpoints (before-contents; null = file didn't exist).
-   * In-memory stack, newest last — revert pops. */
-  private checkpointStack: Array<Map<string, string | null>> = [];
+  /** Turn ledger for the unified rewind (oldest first). One entry per turn,
+   * tying its initiating user-message id to that turn's file checkpoint
+   * (before-contents; null value = file didn't exist). `checkpoint` is null for
+   * a no-edit turn or one trimmed beyond the checkpoint horizon; `hadEdits`
+   * records whether it ever captured files (to warn on horizon-limited rewinds).
+   * `activeCheckpoint` aliases the current turn's map while it runs. */
+  private turns: Array<{
+    id: number;
+    checkpoint: Map<string, string | null> | null;
+    hadEdits: boolean;
+  }> = [];
   private activeCheckpoint: Map<string, string | null> | null = null;
   private static MAX_CHECKPOINT_TURNS = 10;
   private static MAX_CHECKPOINT_FILE_BYTES = 2 * 1024 * 1024;
@@ -154,7 +176,13 @@ export class LunaCodeController {
       msg.type === "usageReport" ||
       msg.type === "streamProgress" ||
       msg.type === "toolOutput" || // live-only; a flood would evict the transcript
-      msg.type === "fileMatches"
+      msg.type === "reasoning" || // live-only thinking; not part of stored messages
+      msg.type === "steeringApplied" || // transient; queued tags don't exist on replay
+      msg.type === "mentionMatches" ||
+      msg.type === "rewindState" || // resent fresh on attach (see sendInit)
+      msg.type === "rewindAssign" || // the userEcho it targets is mutated to carry rewindId
+      msg.type === "rewound" || // transcript is trimmed in place; replay is a no-op
+      msg.type === "rewindPreview" // transient response to a user action
     ) {
       return;
     }
@@ -175,10 +203,11 @@ export class LunaCodeController {
     this.currentSessionId = undefined;
     this.currentCreatedAt = 0;
     this.sessionUsage = { promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0 };
-    this.checkpointStack = [];
+    this.turns = [];
     this.activeCheckpoint = null;
     this.sessionMcpTools = null; // pick up newly-connected MCP servers
     this.postCheckpointState();
+    this.postRewindState();
     this.post({ type: "sessionReset" });
     this.post({ type: "taskList", tasks: [] });
     void this.maybePrewarm();
@@ -204,6 +233,7 @@ export class LunaCodeController {
       model: cfg.model,
       mode: this.mode,
       commands: this.commandList(),
+      fallback: cfg.fallbackModels[0],
     });
   }
 
@@ -269,29 +299,50 @@ export class LunaCodeController {
       case "updateSetting":
         await this.updateSetting(msg.key, msg.value);
         break;
-      case "revertTurn":
-        this.revertLastTurn();
-        break;
       case "getTurnDiff":
         this.sendTurnDiff();
         break;
       case "commitTurn":
         await this.commitLastTurn();
         break;
+      case "revertFile":
+        this.revertReviewedFile(msg.path);
+        break;
+      case "revertHunks":
+        this.revertReviewedHunks(msg.path, msg.hunks);
+        break;
+      case "openDiff":
+        void this.openReviewedDiff(msg.path);
+        break;
       case "getContextInfo":
         void this.sendContextInfo();
         break;
       case "retryTurn":
-        await this.retryLastTurn(false);
+        await this.rewindTo(this.lastTurnId(), "rerun");
         break;
       case "editLastTurn":
-        await this.retryLastTurn(true);
+        await this.rewindTo(this.lastTurnId(), "edit");
+        break;
+      case "retryWithModel":
+        await this.retryWithModel(msg.model);
+        break;
+      case "rewindPreview":
+        this.buildRewindPreview(msg.id);
+        break;
+      case "rewindTo":
+        await this.rewindTo(msg.id, msg.mode);
         break;
       case "exportSession":
         await this.exportSession();
         break;
-      case "queryFiles":
-        void this.queryFiles(msg.query, msg.token, source);
+      case "createMemory":
+        await this.createMemory();
+        break;
+      case "queryMentions":
+        void this.queryMentions(msg.query, msg.token, source);
+        break;
+      case "resolveMention":
+        void this.resolveMention(msg.kind, msg.arg);
         break;
     }
   }
@@ -305,6 +356,7 @@ export class LunaCodeController {
         summarizerModel: cfg.summarizerModel,
         subagentModel: cfg.subagentModel,
         fallbackModels: cfg.fallbackModels,
+        favoriteModels: cfg.favoriteModels,
         prewarmCache: cfg.prewarmCache,
         maxContextTokens: cfg.maxContextTokens,
         autoBudgetCarryCostUsd: cfg.autoBudgetCarryCostUsd,
@@ -316,9 +368,14 @@ export class LunaCodeController {
         dataCollection: cfg.dataCollection,
         zeroDataRetention: cfg.zeroDataRetention,
         providerSort: cfg.providerSort ?? "default",
+        quantizations: cfg.quantizations,
         sessionBudgetUsd: cfg.sessionBudgetUsd,
+        maxTurns: cfg.maxTurns,
+        loopGuardLimit: cfg.loopGuardLimit,
+        reasoningEffort: cfg.reasoningEffort,
         includeActiveFile: cfg.includeActiveFile,
         formatAfterEdit: cfg.formatAfterEdit,
+        revealEditedFiles: cfg.revealEditedFiles,
         worktreeMode: cfg.worktreeMode,
         autoApproveCommands: cfg.autoApproveCommands,
         alwaysDenyCommands: cfg.alwaysDenyCommands,
@@ -336,10 +393,15 @@ export class LunaCodeController {
     "summarizerModel",
     "subagentModel",
     "fallbackModels",
+    "favoriteModels",
     "prewarmCache",
     "sessionBudgetUsd",
+    "maxTurns",
+    "loopGuardLimit",
+    "reasoningEffort",
     "includeActiveFile",
     "formatAfterEdit",
+    "revealEditedFiles",
     "worktreeMode",
     "maxContextTokens",
     "autoBudgetCarryCostUsd",
@@ -351,6 +413,7 @@ export class LunaCodeController {
     "dataCollection",
     "zeroDataRetention",
     "providerSort",
+    "quantizations",
     "autoApproveCommands",
     "alwaysDenyCommands",
     "baseUrl",
@@ -417,11 +480,23 @@ export class LunaCodeController {
     this.currentCreatedAt = s.createdAt;
     this.mode = s.mode;
     this.sessionMcpTools = null;
-    this.checkpointStack = (s.checkpoints ?? []).map((cp) => new Map(cp));
     this.activeCheckpoint = null;
+
+    // Rebuild the turn ledger from persisted anchors (with a legacy fallback),
+    // then pair the freshly-assigned turn-start ids with their checkpoints.
+    const stored = this.storedTurns(s);
+    this.context.loadMessages(
+      s.messages,
+      stored.map((t) => t.startIndex)
+    );
+    const starts = this.context.getTurnStarts();
+    this.turns = starts.map((st, i) => {
+      const cp = stored[i]?.checkpoint;
+      return { id: st.id, checkpoint: cp ? new Map(cp) : null, hadEdits: !!(cp && cp.length) };
+    });
+
     this.postCheckpointState();
     this.post({ type: "taskList", tasks: [] });
-    this.context.loadMessages(s.messages);
     this.sessionApprovedKinds.clear();
     this.pendingSelections = [];
     this.queue = [];
@@ -435,9 +510,31 @@ export class LunaCodeController {
     this.post({ type: "sessionReset" });
     await this.sendConfig();
     this.post({ type: "sessionUsage", usage: this.sessionUsage });
-    for (const ev of messagesToEvents(s.messages)) {
+    const rewindIdByIndex = new Map(starts.map((st) => [st.index, st.id]));
+    for (const ev of messagesToEvents(s.messages, rewindIdByIndex)) {
       this.post(ev);
     }
+    this.postRewindState();
+  }
+
+  /** Turn ledger from a stored session, with a best-effort fallback for legacy
+   * sessions that only persisted the old edit-turn `checkpoints` stack. */
+  private storedTurns(
+    s: StoredSession
+  ): Array<{ startIndex: number; checkpoint?: Array<[string, string | null]> }> {
+    if (s.turns && s.turns.length) return s.turns;
+    const userIdx: number[] = [];
+    s.messages.forEach((m, i) => {
+      if (m.role === "user") userIdx.push(i);
+    });
+    const cps = s.checkpoints ?? [];
+    // Attach the K legacy checkpoints (oldest→newest) to the LAST K user
+    // messages, matching how the old stack retained the most-recent edit turns.
+    const firstCp = Math.max(0, userIdx.length - cps.length);
+    return userIdx.map((startIndex, j) => ({
+      startIndex,
+      checkpoint: j >= firstCp ? cps[j - firstCp] : undefined,
+    }));
   }
 
   private async persistCurrent() {
@@ -457,7 +554,7 @@ export class LunaCodeController {
       mode: this.mode,
       messages: msgs,
       usage: this.sessionUsage,
-      checkpoints: this.serializeCheckpoints(),
+      turns: this.serializeTurns(),
     };
     try {
       await this.sessions.save(session);
@@ -480,11 +577,15 @@ export class LunaCodeController {
         description: m.description,
       })),
       commands: this.commandList(),
+      fallback: cfg.fallbackModels[0],
     } satisfies HostToWebview);
     // Replay history so a freshly-attached surface shows the conversation.
     for (const ev of this.transcript) {
       void source.postMessage(ev);
     }
+    // rewindState isn't recorded (it churns each turn), so send the current set
+    // directly to this surface for correct button enable/disable after replay.
+    void source.postMessage({ type: "rewindState", points: this.rewindPoints() } satisfies HostToWebview);
     void this.maybePrewarm();
   }
 
@@ -526,14 +627,46 @@ export class LunaCodeController {
    * prefix is stable again. */
   private readProjectMemory(root: string): string | undefined {
     const sections: string[] = [];
+    const clip = (text: string, max: number, label = "") =>
+      text.length > max ? text.slice(0, max) + `\n…[${label || "truncated"}]` : text;
+
+    // Global user rules apply across every project (personal conventions).
     try {
-      const rootFile = path.join(root, "LUNA.md");
-      if (fs.existsSync(rootFile)) {
-        const text = fs.readFileSync(rootFile, "utf8").trim();
+      const globalFile = path.join(os.homedir(), ".lunacode", "LUNA.md");
+      if (fs.existsSync(globalFile)) {
+        const text = fs.readFileSync(globalFile, "utf8").trim();
+        if (text) sections.push("### Global rules (~/.lunacode/LUNA.md)\n" + clip(text, 4000));
+      }
+    } catch {
+      /* global rules are best-effort */
+    }
+
+    try {
+      // Root project memory: LUNA.md, or a recognized equivalent from another
+      // tool so users don't have to duplicate their rules.
+      const ROOT_NAMES = ["LUNA.md", "AGENTS.md", "CLAUDE.md", ".cursorrules"];
+      const rootName = ROOT_NAMES.find((n) => fs.existsSync(path.join(root, n)));
+      if (rootName) {
+        const text = fs.readFileSync(path.join(root, rootName), "utf8").trim();
         if (text) {
-          const MAX = 6000;
-          sections.push(text.length > MAX ? text.slice(0, MAX) + "\n…[LUNA.md truncated]" : text);
+          const body = clip(text, 6000, `${rootName} truncated`);
+          sections.push(rootName === "LUNA.md" ? body : `### ${rootName}\n${body}`);
         }
+      }
+      // Cursor-style rule files under .cursor/rules/*.md
+      try {
+        const rulesDir = path.join(root, ".cursor", "rules");
+        const files = fs
+          .readdirSync(rulesDir)
+          .filter((f) => f.endsWith(".md") || f.endsWith(".mdc"))
+          .sort()
+          .slice(0, 4);
+        for (const f of files) {
+          const text = fs.readFileSync(path.join(rulesDir, f), "utf8").trim();
+          if (text) sections.push(`### .cursor/rules/${f}\n` + clip(text, 1500));
+        }
+      } catch {
+        /* no cursor rules */
       }
       // Nested memory files (depth-limited walk, ignored dirs skipped).
       const nested: string[] = [];
@@ -602,14 +735,8 @@ export class LunaCodeController {
       return;
     }
 
-    // Slash commands: /name expands to its template; extra text is appended.
-    let userText = trimmed;
-    const slash = /^\/([a-zA-Z0-9_-]+)\b\s*([\s\S]*)$/.exec(trimmed);
-    if (slash) {
-      const cfg = getConfig();
-      const template = cfg.customCommands[slash[1]] ?? SLASH_COMMANDS[slash[1]];
-      if (template) userText = template + (slash[2] ? `\n\n${slash[2]}` : "");
-    }
+    // Slash commands: /name expands to its template (with argument interpolation).
+    let userText = this.expandSlash(trimmed);
 
     // Fold any queued editor selections into this message now.
     if (this.pendingSelections.length) {
@@ -623,12 +750,14 @@ export class LunaCodeController {
 
     // Echo immediately. If a turn is already active, this becomes steering for
     // the running task (drained by the agent) or the next queued turn.
+    const echoId = this.echoSeq++;
     this.post({
       type: "userEcho",
       text: trimmed + (images?.length ? `\n\n🖼 ${images.length} image(s) attached` : ""),
       queued: this.running,
+      echoId,
     });
-    this.queue.push({ text: userText, images });
+    this.queue.push({ text: userText, images, echoId });
     void this.pump();
   }
 
@@ -660,7 +789,7 @@ export class LunaCodeController {
     if (next === undefined) return;
     this.running = true;
     try {
-      await this.runTurn(next.text, next.images);
+      await this.runTurn(next.text, next.images, next.echoId);
     } finally {
       this.running = false;
       await this.persistCurrent();
@@ -668,7 +797,7 @@ export class LunaCodeController {
     }
   }
 
-  private async runTurn(userText: string, images?: string[]) {
+  private async runTurn(userText: string, images?: string[], echoId?: number) {
     const cfg = getConfig();
     const apiKey = await this.secrets.getApiKey();
     let root = this.workspaceRoot();
@@ -695,6 +824,8 @@ export class LunaCodeController {
       dataCollection: cfg.dataCollection,
       zdr: cfg.zeroDataRetention,
       providerSort: cfg.providerSort,
+      quantizations: cfg.quantizations,
+      reasoningEffort: cfg.reasoningEffort === "default" ? undefined : cfg.reasoningEffort,
     });
 
     this.agent = new Agent(
@@ -709,6 +840,8 @@ export class LunaCodeController {
         summarizerModel: cfg.summarizerModel || cfg.model,
         compactionTargetRatio: cfg.compactionTargetRatio,
         subagentModel: cfg.subagentModel,
+        maxTurns: cfg.maxTurns,
+        loopGuardLimit: cfg.loopGuardLimit,
         snapshotFile: (relPath) => this.snapshotFile(root, relPath),
         extraTools: (this.sessionMcpTools ??= this.mcp.getTools()),
         // Mid-turn steering: the agent drains queued messages each iteration.
@@ -728,18 +861,244 @@ export class LunaCodeController {
     );
 
     this.activeCheckpoint = new Map();
+    // The turn-initiating addUser (agent.ts) is the next context mutation, so it
+    // will receive exactly this id — deterministic and compaction-proof.
+    const turnStartId = this.context.peekIdSeq();
+    const entry: (typeof this.turns)[number] = {
+      id: turnStartId,
+      checkpoint: this.activeCheckpoint,
+      hadEdits: false,
+    };
+    this.turns.push(entry);
     try {
       await this.agent.run(userText, this.mode, images);
     } finally {
-      if (this.activeCheckpoint && this.activeCheckpoint.size > 0) {
-        this.checkpointStack.push(this.activeCheckpoint);
-        if (this.checkpointStack.length > LunaCodeController.MAX_CHECKPOINT_TURNS) {
-          this.checkpointStack.shift();
-        }
+      if (this.context.indexOfId(turnStartId) < 0) {
+        // The turn never registered its user message (e.g. an early error).
+        const i = this.turns.indexOf(entry);
+        if (i >= 0) this.turns.splice(i, 1);
+      } else {
+        entry.hadEdits = !!(this.activeCheckpoint && this.activeCheckpoint.size > 0);
+        if (!entry.hadEdits) entry.checkpoint = null;
+        this.attachRewind(echoId, turnStartId);
       }
       this.activeCheckpoint = null;
+      this.trimCheckpointHorizon();
       this.postCheckpointState();
+      this.postRewindState();
     }
+  }
+
+  /** After a turn starts, tie its bubble to its rewind id: reflect the id onto
+   * the recorded userEcho (so re-attaching surfaces tag it) and tell live
+   * surfaces to show the button now. */
+  private attachRewind(echoId: number | undefined, rewindId: number) {
+    if (echoId === undefined) return;
+    for (let i = this.transcript.length - 1; i >= 0; i--) {
+      const m = this.transcript[i];
+      if (m.type === "userEcho" && m.echoId === echoId) {
+        m.rewindId = rewindId;
+        break;
+      }
+    }
+    this.post({ type: "rewindAssign", echoId, rewindId });
+  }
+
+  /** id of the most recent turn (for the menu's Retry/Edit shortcuts), or -1. */
+  private lastTurnId(): number {
+    return this.turns[this.turns.length - 1]?.id ?? -1;
+  }
+
+  /** Switch to a (fallback) model, then rewind + re-run the last turn. */
+  private async retryWithModel(model: string) {
+    if (model) {
+      await vscode.workspace
+        .getConfiguration("lunacode")
+        .update("model", model, vscode.ConfigurationTarget.Global);
+      await this.sendConfig();
+      this.post({ type: "status", message: `Switched to ${model} — retrying the last message…` });
+    }
+    await this.rewindTo(this.lastTurnId(), "rerun");
+  }
+
+  /** Create a starter LUNA.md (project memory) if absent, then open it. */
+  private async createMemory() {
+    const root = this.workspaceRoot();
+    if (!root) {
+      this.post({ type: "status", message: "Open a folder to create project memory." });
+      return;
+    }
+    const abs = path.join(root, "LUNA.md");
+    try {
+      if (!fs.existsSync(abs)) {
+        const starter = `# Project memory (LUNA.md)
+
+Luna Code reads this file every turn. Keep it terse. Good things to record:
+
+## Commands
+- Build:
+- Test:
+- Lint/format:
+
+## Conventions
+- (code style, patterns, naming)
+
+## Architecture
+- (key modules and how they fit)
+
+## Gotchas
+- (footguns, non-obvious setup)
+`;
+        fs.writeFileSync(abs, starter, "utf8");
+      }
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(abs));
+      await vscode.window.showTextDocument(doc);
+      this.post({
+        type: "status",
+        message: "LUNA.md opened — jot down build/test commands, conventions, and gotchas.",
+      });
+    } catch (e: any) {
+      this.post({ type: "error", message: `Couldn't create LUNA.md: ${e?.message ?? e}` });
+    }
+  }
+
+  /** Most recent turn that still holds a file checkpoint (for review/commit). */
+  private topCheckpoint(): Map<string, string | null> | undefined {
+    for (let i = this.turns.length - 1; i >= 0; i--) {
+      const cp = this.turns[i].checkpoint;
+      if (cp) return cp;
+    }
+    return undefined;
+  }
+
+  /** Keep only the MAX_CHECKPOINT_TURNS most-recent edit-turns' file payloads;
+   * older turns keep their ledger entry (still context-rewindable) but drop the
+   * checkpoint to free memory. */
+  private trimCheckpointHorizon() {
+    let editTurns = 0;
+    for (let i = this.turns.length - 1; i >= 0; i--) {
+      if (!this.turns[i].checkpoint) continue;
+      editTurns++;
+      if (editTurns > LunaCodeController.MAX_CHECKPOINT_TURNS) {
+        this.turns[i].checkpoint = null;
+      }
+    }
+  }
+
+  /** Rewindable turn-start points (id + restorable file count). Turns compacted
+   * out of the live context are omitted so their buttons hide. */
+  private rewindPoints(): { id: number; files: number }[] {
+    const points: { id: number; files: number }[] = [];
+    for (let k = 0; k < this.turns.length; k++) {
+      if (this.context.indexOfId(this.turns[k].id) < 0) continue;
+      points.push({ id: this.turns[k].id, files: collapseRestoreSet(this.turns, k).size });
+    }
+    return points;
+  }
+
+  private postRewindState() {
+    this.post({ type: "rewindState", points: this.rewindPoints() });
+  }
+
+  /** Answer a rewindPreview request with the confirm-dialog details. */
+  private buildRewindPreview(id: number) {
+    const idx = this.context.indexOfId(id);
+    if (idx < 0) {
+      this.post({ type: "status", message: "That point was compacted and can no longer be rewound." });
+      return;
+    }
+    const k = this.turns.findIndex((t) => t.id === id);
+    const restore = k >= 0 ? collapseRestoreSet(this.turns, k) : new Map<string, string | null>();
+    let filesRestored = 0;
+    let filesDeleted = 0;
+    for (const before of restore.values()) before === null ? filesDeleted++ : filesRestored++;
+    // Any discarded turn that made edits but no longer has a checkpoint was
+    // trimmed beyond the horizon — its files can't be restored.
+    let horizonExceeded = false;
+    if (k >= 0) {
+      for (let t = k; t < this.turns.length; t++) {
+        if (this.turns[t].hadEdits && !this.turns[t].checkpoint) horizonExceeded = true;
+      }
+    }
+    const messages = this.context.getMessages();
+    const text = extractText(messages[idx]?.content ?? "");
+    this.post({
+      type: "rewindPreview",
+      id,
+      messagesDiscarded: messages.length - idx,
+      filesRestored,
+      filesDeleted,
+      horizonExceeded,
+      text,
+    });
+  }
+
+  /** Unified rewind: restore files to their state before turn `id`, truncate the
+   * model context and transcript to that point, then either re-run the message
+   * (resend) or drop it into the composer to edit. */
+  private async rewindTo(id: number, mode: "rollback" | "edit" | "rerun") {
+    if (this.running) {
+      this.post({ type: "status", message: "Can't rewind while a turn is running — stop it first." });
+      return;
+    }
+    const idx = this.context.indexOfId(id);
+    if (idx < 0) {
+      this.post({ type: "status", message: "That point was compacted and can no longer be rewound." });
+      return;
+    }
+    const k = this.turns.findIndex((t) => t.id === id);
+    // Restore files (earliest before-state across the discarded turns).
+    const restore = k >= 0 ? collapseRestoreSet(this.turns, k) : new Map<string, string | null>();
+    let restored = 0;
+    let deleted = 0;
+    let failed = 0;
+    for (const [abs, before] of restore) {
+      try {
+        if (before === null) {
+          fs.rmSync(abs, { force: true });
+          deleted++;
+        } else {
+          fs.writeFileSync(abs, before, "utf8");
+          restored++;
+        }
+      } catch {
+        failed++;
+      }
+    }
+    // Truncate context + ledger + queue.
+    const rolled = this.context.rollbackToIndex(idx);
+    if (k >= 0) this.turns.splice(k);
+    this.queue = [];
+    // Trim the replay transcript from the target bubble onward.
+    const cut = this.transcript.findIndex((m) => m.type === "userEcho" && m.rewindId === id);
+    if (cut >= 0) this.transcript.splice(cut);
+    this.post({ type: "rewound", id });
+    const bits: string[] = [];
+    if (restored) bits.push(`${restored} file(s) restored`);
+    if (deleted) bits.push(`${deleted} created file(s) removed`);
+    if (failed) bits.push(`${failed} failed`);
+    this.post({
+      type: "status",
+      message: `⟲ Rewound — ${bits.join(", ") || "no file changes"}. (Command side effects are not undone.)`,
+    });
+    this.postCheckpointState();
+    this.postRewindState();
+    if (mode === "rerun" && rolled && rolled.text) {
+      // Re-queue DIRECTLY (the rolled text already carries slash expansion,
+      // selections, and the editor note). Fresh echoId → a new rewind button.
+      const echoId = this.echoSeq++;
+      this.post({ type: "userEcho", text: rolled.text, queued: false, echoId });
+      this.queue.push({
+        text: rolled.text,
+        images: rolled.images.length ? rolled.images : undefined,
+        echoId,
+      });
+      void this.pump();
+    } else if (mode === "edit" && rolled) {
+      this.post({ type: "composerFill", text: rolled.text });
+    }
+    // mode === "rollback": files restored + context/transcript trimmed; stop here.
+    await this.persistCurrent();
   }
 
   // --- turn checkpoints (revert support) ---
@@ -763,73 +1122,44 @@ export class LunaCodeController {
     }
   }
 
-  private revertLastTurn() {
-    if (this.running) {
-      this.post({ type: "status", message: "Can't revert while a turn is running." });
-      return;
-    }
-    const checkpoint = this.checkpointStack.pop();
-    if (!checkpoint) {
-      this.post({ type: "status", message: "Nothing to revert." });
-      return;
-    }
-    let restored = 0;
-    let deleted = 0;
-    let failed = 0;
-    for (const [abs, before] of checkpoint) {
-      try {
-        if (before === null) {
-          fs.rmSync(abs, { force: true });
-          deleted++;
-        } else {
-          fs.writeFileSync(abs, before, "utf8");
-          restored++;
-        }
-      } catch {
-        failed++;
-      }
-    }
-    const bits: string[] = [];
-    if (restored) bits.push(`${restored} file(s) restored`);
-    if (deleted) bits.push(`${deleted} created file(s) removed`);
-    if (failed) bits.push(`${failed} failed`);
-    this.post({
-      type: "status",
-      message: `↩ Reverted the last turn's edits — ${bits.join(", ") || "no changes"}. (Command side effects are not reverted.)`,
-    });
-    this.postCheckpointState();
-  }
-
-  /** Serialize checkpoints for persistence with size caps (Memento-friendly). */
-  private serializeCheckpoints(): Array<Array<[string, string | null]>> {
-    const out: Array<Array<[string, string | null]>> = [];
+  /** Serialize the turn ledger for persistence with size caps (Memento-friendly).
+   * Each entry anchors to its turn-start message index so rewind survives a
+   * reload; no-edit turns persist as an anchor with no checkpoint. */
+  private serializeTurns(): Array<{ startIndex: number; checkpoint?: Array<[string, string | null]> }> {
+    const out: Array<{ startIndex: number; checkpoint?: Array<[string, string | null]> }> = [];
     let total = 0;
-    for (const cp of this.checkpointStack) {
-      const entries: Array<[string, string | null]> = [];
-      for (const [p, v] of cp) {
-        const size = v?.length ?? 0;
-        if (size > 256 * 1024) continue;
-        total += size;
-        if (total > 1_000_000) return out;
-        entries.push([p, v]);
+    for (const t of this.turns) {
+      const startIndex = this.context.indexOfId(t.id);
+      if (startIndex < 0) continue; // compacted away — not rewindable
+      let checkpoint: Array<[string, string | null]> | undefined;
+      if (t.checkpoint) {
+        const entries: Array<[string, string | null]> = [];
+        for (const [p, v] of t.checkpoint) {
+          const size = v?.length ?? 0;
+          if (size > 256 * 1024) continue;
+          if (total + size > 1_000_000) break;
+          total += size;
+          entries.push([p, v]);
+        }
+        if (entries.length) checkpoint = entries;
       }
-      if (entries.length) out.push(entries);
+      out.push({ startIndex, checkpoint });
     }
     return out;
   }
 
   private postCheckpointState() {
-    const top = this.checkpointStack[this.checkpointStack.length - 1];
+    const top = this.topCheckpoint();
     this.post({
       type: "checkpointState",
-      turns: this.checkpointStack.length,
+      turns: this.turns.filter((t) => t.checkpoint).length,
       files: top ? top.size : 0,
     });
   }
 
   /** Side-by-side diffs of the last turn's edits (checkpoint vs disk). */
   private sendTurnDiff() {
-    const checkpoint = this.checkpointStack[this.checkpointStack.length - 1];
+    const checkpoint = this.topCheckpoint();
     const root = this.workspaceRoot();
     if (!checkpoint || !root) {
       this.post({ type: "status", message: "No turn edits to review." });
@@ -843,15 +1173,97 @@ export class LunaCodeController {
       } catch {
         after = null; // deleted since
       }
+      if ((before ?? "") === (after ?? "")) continue; // fully reverted — nothing to show
       const rel = abs.startsWith(root) ? abs.slice(root.length + 1) : abs;
       diffs.push(computeDiff(before ?? "", after ?? "", rel));
     }
     this.post({ type: "turnDiff", diffs });
   }
 
+  private reviewAbs(rel: string): string | undefined {
+    const root = this.workspaceRoot();
+    if (!root) return undefined;
+    return path.isAbsolute(rel) ? rel : path.join(root, rel);
+  }
+
+  /** Revert one reviewed file to its pre-turn state (from the top checkpoint). */
+  private revertReviewedFile(rel: string) {
+    if (this.running) {
+      this.post({ type: "status", message: "Finish the current turn before reverting." });
+      return;
+    }
+    const abs = this.reviewAbs(rel);
+    const before = abs ? this.topCheckpoint()?.get(abs) : undefined;
+    if (!abs || before === undefined) {
+      this.post({ type: "status", message: `No recorded pre-turn state for ${rel}.` });
+      return;
+    }
+    try {
+      if (before === null) {
+        fs.rmSync(abs, { force: true });
+        this.post({ type: "status", message: `↩ Removed ${rel} (it was created this turn).` });
+      } else {
+        fs.writeFileSync(abs, before, "utf8");
+        this.post({ type: "status", message: `↩ Reverted ${rel} to its pre-turn state.` });
+      }
+    } catch (e: any) {
+      this.post({ type: "error", message: `Revert failed: ${e?.message ?? e}` });
+      return;
+    }
+    this.sendTurnDiff();
+  }
+
+  /** Revert only the selected change blocks of a reviewed file. */
+  private revertReviewedHunks(rel: string, hunks: number[]) {
+    if (this.running) {
+      this.post({ type: "status", message: "Finish the current turn before reverting." });
+      return;
+    }
+    const abs = this.reviewAbs(rel);
+    const before = abs ? this.topCheckpoint()?.get(abs) : undefined;
+    if (!abs || before === undefined) {
+      this.post({ type: "status", message: `No recorded pre-turn state for ${rel}.` });
+      return;
+    }
+    let after = "";
+    try {
+      after = fs.readFileSync(abs, "utf8");
+    } catch {
+      after = "";
+    }
+    const result = reconstructWithReverts(before ?? "", after, new Set(hunks));
+    try {
+      fs.writeFileSync(abs, result, "utf8");
+    } catch (e: any) {
+      this.post({ type: "error", message: `Revert failed: ${e?.message ?? e}` });
+      return;
+    }
+    this.post({ type: "status", message: `↩ Reverted ${hunks.length} hunk(s) in ${rel}.` });
+    this.sendTurnDiff();
+  }
+
+  /** Open a native editor diff (pre-turn ↔ current) for a reviewed file. */
+  private async openReviewedDiff(rel: string) {
+    const abs = this.reviewAbs(rel);
+    if (!abs) return;
+    const before = this.topCheckpoint()?.get(abs) ?? "";
+    try {
+      const tmp = path.join(os.tmpdir(), `lunacode-before-${Date.now()}-${path.basename(rel)}`);
+      fs.writeFileSync(tmp, before, "utf8");
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        vscode.Uri.file(tmp),
+        vscode.Uri.file(abs),
+        `${rel} — before ↔ now`
+      );
+    } catch (e: any) {
+      this.post({ type: "error", message: `Couldn't open diff: ${e?.message ?? e}` });
+    }
+  }
+
   /** Stage + commit the last turn's edited files with a generated message. */
   private async commitLastTurn() {
-    const checkpoint = this.checkpointStack[this.checkpointStack.length - 1];
+    const checkpoint = this.topCheckpoint();
     const root = this.workspaceRoot();
     if (!checkpoint || !root) {
       this.post({ type: "status", message: "No turn edits to commit." });
@@ -954,66 +1366,128 @@ export class LunaCodeController {
     });
   }
 
-  /** Roll the conversation back to (and including) the last user message.
-   * retry=false re-sends it; edit=true puts it in the composer instead. */
-  private async retryLastTurn(edit: boolean) {
-    if (this.running) {
-      this.post({ type: "status", message: "Wait for the current turn to finish (or stop it) first." });
-      return;
-    }
-    const rolled = this.context.rollbackToLastUser();
-    if (rolled === null) {
-      this.post({ type: "status", message: "Nothing to retry." });
-      return;
-    }
-    // Trim the replayable transcript back to before the last user echo.
-    const lastEcho = this.transcript
-      .map((m, i) => ({ m, i }))
-      .filter(({ m }) => m.type === "userEcho")
-      .pop();
-    if (lastEcho) this.transcript.splice(lastEcho.i);
-    this.post({ type: "rollback" });
-    if (edit) {
-      this.post({ type: "composerFill", text: rolled.text });
-    } else {
-      // Re-queue DIRECTLY: the rolled-back text already carries slash
-      // expansion, selections, and the editor note — onSend would add them
-      // twice. Images ride along too.
-      this.post({ type: "userEcho", text: rolled.text, queued: false });
-      this.queue.push({ text: rolled.text, images: rolled.images.length ? rolled.images : undefined });
-      void this.pump();
-    }
-  }
-
   /** Fuzzy file matches for @-mention completion (cached workspace walk). */
-  private async queryFiles(query: string, token: number, source: vscode.Webview) {
+  /** @-mention completions: special context providers, workspace symbols,
+   * folders, and files. */
+  private async queryMentions(query: string, token: number, source: vscode.Webview) {
+    const items: MentionItem[] = [];
+    const q = query.toLowerCase();
+    const root = this.workspaceRoot() ?? "";
+    const rel = (p: string) => (p.startsWith(root) ? p.slice(root.length + 1) : p);
+
+    // Special context providers (surface on empty/short query or keyword match).
+    const specials: Array<{ kind: "problems" | "git"; label: string; detail: string; key: string }> = [
+      { kind: "problems", label: "problems", detail: "attach current diagnostics", key: "problems diagnostics errors" },
+      { kind: "git", label: "git", detail: "attach the working-tree diff", key: "git diff changes" },
+    ];
+    for (const s of specials) {
+      if (!q || s.label.startsWith(q) || s.key.includes(q)) {
+        items.push({ kind: s.kind, label: s.label, detail: s.detail });
+      }
+    }
+
+    // Workspace symbols (needs a couple of chars).
+    if (query.length >= 2) {
+      try {
+        const syms =
+          (await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+            "vscode.executeWorkspaceSymbolProvider",
+            query
+          )) ?? [];
+        for (const s of syms.slice(0, 6)) {
+          const loc = `${rel(s.location.uri.fsPath)}:${s.location.range.start.line + 1}`;
+          items.push({ kind: "symbol", label: s.name, insert: loc, detail: loc });
+        }
+      } catch {
+        /* no symbol provider */
+      }
+    }
+
+    // Files + folders (cached workspace walk).
     const now = Date.now();
     if (!this.fileListCache || now - this.fileListCache.at > 30_000) {
       const uris = await vscode.workspace.findFiles("**/*", "**/node_modules/**", 5000);
-      const root = this.workspaceRoot() ?? "";
-      this.fileListCache = {
-        at: now,
-        files: uris
-          .map((u) => (u.fsPath.startsWith(root) ? u.fsPath.slice(root.length + 1) : u.fsPath))
-          .sort(),
-      };
+      this.fileListCache = { at: now, files: uris.map((u) => rel(u.fsPath)).sort() };
     }
-    const q = query.toLowerCase();
-    const scored: Array<{ f: string; s: number }> = [];
+    const score = (lower: string): number => {
+      if (!q) return 0;
+      if (lower.includes(q)) return 100 - lower.indexOf(q) - (lower.length - q.length) * 0.01;
+      if (isSubsequence(q, lower)) return 10 - lower.length * 0.01;
+      return -1;
+    };
+    const folders = new Set<string>();
     for (const f of this.fileListCache.files) {
-      const lower = f.toLowerCase();
-      let s = -1;
-      if (!q) s = 0;
-      else if (lower.includes(q)) s = 100 - lower.indexOf(q) - (lower.length - q.length) * 0.01;
-      else if (isSubsequence(q, lower)) s = 10 - lower.length * 0.01;
-      if (s >= 0) scored.push({ f, s });
+      const parts = f.split("/");
+      let acc = "";
+      for (let i = 0; i < parts.length - 1; i++) {
+        acc = acc ? acc + "/" + parts[i] : parts[i];
+        folders.add(acc);
+      }
     }
-    scored.sort((a, b) => b.s - a.s);
-    void source.postMessage({
-      type: "fileMatches",
-      token,
-      files: scored.slice(0, 12).map((x) => x.f),
-    } satisfies HostToWebview);
+    const rank = (list: string[]) =>
+      list
+        .map((f) => ({ f, s: score(f.toLowerCase()) }))
+        .filter((x) => x.s >= 0)
+        .sort((a, b) => b.s - a.s);
+    for (const { f } of rank([...folders]).slice(0, 4)) {
+      items.push({ kind: "folder", label: f + "/", insert: f });
+    }
+    for (const { f } of rank(this.fileListCache.files).slice(0, 10)) {
+      items.push({ kind: "file", label: f, insert: f });
+    }
+
+    void source.postMessage({ type: "mentionMatches", token, items } satisfies HostToWebview);
+  }
+
+  /** Resolve a host-side mention into attached context (folded into the next
+   * message like an editor selection). @terminal is intentionally omitted —
+   * stable VS Code APIs don't expose terminal buffer contents. */
+  private async resolveMention(kind: string, _arg?: string) {
+    const root = this.workspaceRoot();
+    if (kind === "problems") {
+      const lines: string[] = [];
+      let count = 0;
+      for (const [uri, diags] of vscode.languages.getDiagnostics()) {
+        if (!diags.length) continue;
+        const r = root && uri.fsPath.startsWith(root) ? uri.fsPath.slice(root.length + 1) : uri.fsPath;
+        for (const d of diags) {
+          if (count >= 50) break;
+          const sev = ["Error", "Warning", "Info", "Hint"][d.severity] ?? "Info";
+          lines.push(`${r}:${d.range.start.line + 1} [${sev}] ${d.message.split("\n")[0]}`);
+          count++;
+        }
+      }
+      if (!count) {
+        this.post({ type: "status", message: "No diagnostics to attach." });
+        return;
+      }
+      this.pendingSelections.push(`Current diagnostics (${count}):\n${lines.join("\n")}`);
+      this.post({ type: "status", message: `Attached ${count} diagnostic(s) — type what to do, then send.` });
+      return;
+    }
+    if (kind === "git") {
+      if (!root) {
+        this.post({ type: "status", message: "Open a folder to attach a git diff." });
+        return;
+      }
+      try {
+        const staged = await execGit(root, ["diff", "--cached"]).catch(() => "");
+        const unstaged = await execGit(root, ["diff"]).catch(() => "");
+        let diff = [staged && `# staged\n${staged}`, unstaged && `# unstaged\n${unstaged}`]
+          .filter(Boolean)
+          .join("\n\n");
+        if (!diff.trim()) {
+          this.post({ type: "status", message: "Working tree is clean — nothing to attach." });
+          return;
+        }
+        const MAX = 12000;
+        if (diff.length > MAX) diff = diff.slice(0, MAX) + "\n…[diff truncated]";
+        this.pendingSelections.push("Current git diff:\n```diff\n" + diff + "\n```");
+        this.post({ type: "status", message: "Attached the working-tree diff — type what to do, then send." });
+      } catch (e: any) {
+        this.post({ type: "error", message: `git diff failed: ${e?.message ?? e}` });
+      }
+    }
   }
 
   // --- worktree sandbox (lunacode.worktreeMode) ---
@@ -1138,7 +1612,52 @@ export class LunaCodeController {
   /** Available slash commands (builtins + custom), for composer autocomplete. */
   private commandList(): string[] {
     const custom = Object.keys(getConfig().customCommands);
-    return [...new Set([...Object.keys(SLASH_COMMANDS), ...custom])];
+    const project = Object.keys(this.projectCommands());
+    return [...new Set([...Object.keys(SLASH_COMMANDS), ...project, ...custom])];
+  }
+
+  /** Project-scoped slash commands from .luna/commands/*.md (filename → template). */
+  private projectCommands(): Record<string, string> {
+    const root = this.workspaceRoot();
+    if (!root) return {};
+    const out: Record<string, string> = {};
+    try {
+      const dir = path.join(root, ".luna", "commands");
+      for (const f of fs.readdirSync(dir)) {
+        if (!f.endsWith(".md")) continue;
+        const name = f.slice(0, -3);
+        if (!/^[a-zA-Z0-9_-]+$/.test(name)) continue;
+        try {
+          const text = fs.readFileSync(path.join(dir, f), "utf8").trim();
+          if (text) out[name] = text;
+        } catch {
+          /* skip unreadable command */
+        }
+      }
+    } catch {
+      /* no project commands dir */
+    }
+    return out;
+  }
+
+  /** Resolve `/name args` into its template, interpolating $ARGUMENTS and $1..$9.
+   * Precedence: user customCommands > project commands > built-ins. Unknown
+   * commands are sent through unchanged. */
+  private expandSlash(trimmed: string): string {
+    const slash = /^\/([a-zA-Z0-9_-]+)\b\s*([\s\S]*)$/.exec(trimmed);
+    if (!slash) return trimmed;
+    const name = slash[1];
+    const args = slash[2] ?? "";
+    const template =
+      getConfig().customCommands[name] ?? this.projectCommands()[name] ?? SLASH_COMMANDS[name];
+    if (template === undefined) return trimmed;
+    if (/\$(ARGUMENTS|[1-9])/.test(template)) {
+      const positional = args.split(/\s+/).filter(Boolean);
+      return template
+        .replace(/\$ARGUMENTS/g, args)
+        .replace(/\$([1-9])/g, (_m, d) => positional[Number(d) - 1] ?? "");
+    }
+    return template + (args ? `\n\n${args}` : "");
   }
 
   /** Pre-warm the provider prompt cache so the first real message of a session
@@ -1173,6 +1692,8 @@ export class LunaCodeController {
       dataCollection: cfg.dataCollection,
       zdr: cfg.zeroDataRetention,
       providerSort: cfg.providerSort,
+      quantizations: cfg.quantizations,
+      reasoningEffort: cfg.reasoningEffort === "default" ? undefined : cfg.reasoningEffort,
     });
     const allowsMutation = MODES[this.mode].allowsMutation;
     const tools = [
@@ -1291,10 +1812,28 @@ export class LunaCodeController {
     });
   }
 
+  private static EDIT_TOOL_NAMES = new Set(["write_file", "edit_file", "apply_patch"]);
+
+  /** Reveal a just-edited file in a preview tab without stealing focus, so edits
+   * are visible as they land. Gated by lunacode.revealEditedFiles. */
+  private async revealEditedFile(name: string, diff?: import("./protocol").DiffData) {
+    if (!LunaCodeController.EDIT_TOOL_NAMES.has(name) || !diff?.path) return;
+    if (!getConfig().revealEditedFiles) return;
+    const root = this.workspaceRoot();
+    if (!root) return;
+    try {
+      const abs = path.isAbsolute(diff.path) ? diff.path : path.join(root, diff.path);
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(abs));
+      await vscode.window.showTextDocument(doc, { preview: true, preserveFocus: true });
+    } catch {
+      // File may have been deleted or is binary — ignore.
+    }
+  }
+
   private forwardEvent(e: import("../agent/agent").AgentEvent) {
     switch (e.type) {
       case "turn_start":
-        this.post({ type: "turnStart" });
+        this.post({ type: "turnStart", model: this.activeModel || getConfig().model });
         break;
       case "text":
         this.post({ type: "assistantText", delta: e.delta });
@@ -1316,9 +1855,14 @@ export class LunaCodeController {
             removed: e.diff.delCount,
           });
         }
+        // Reveal the edited file live (non-intrusive: preview tab, focus stays).
+        if (e.ok) void this.revealEditedFile(e.name, e.diff);
         break;
       case "status":
         this.post({ type: "status", message: e.message });
+        break;
+      case "steering":
+        this.post({ type: "steeringApplied" });
         break;
       case "usage": {
         const cost = e.usage.cost ?? 0;
@@ -1497,14 +2041,22 @@ function extractText(content: ChatMessage["content"]): string {
   return "";
 }
 
-/** Reconstruct UI events from stored messages so a loaded session re-renders. */
-function messagesToEvents(messages: ChatMessage[]): HostToWebview[] {
+/** Reconstruct UI events from stored messages so a loaded session re-renders.
+ * `rewindIdByIndex` tags turn-start user bubbles with their rewind id. */
+function messagesToEvents(
+  messages: ChatMessage[],
+  rewindIdByIndex?: Map<number, number>
+): HostToWebview[] {
   const events: HostToWebview[] = [];
   const toolNames = new Map<string, string>();
-  for (const m of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
     if (m.role === "user") {
       const t = extractText(m.content);
-      if (t.trim()) events.push({ type: "userEcho", text: t });
+      if (t.trim()) {
+        const rewindId = rewindIdByIndex?.get(i);
+        events.push(rewindId !== undefined ? { type: "userEcho", text: t, rewindId } : { type: "userEcho", text: t });
+      }
     } else if (m.role === "assistant") {
       const t = extractText(m.content);
       if (t.trim()) events.push({ type: "assistantText", delta: t });

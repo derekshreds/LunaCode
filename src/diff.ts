@@ -86,10 +86,12 @@ export function computeDiff(
   }
 
   // Second pass: emit rows, pairing del/add runs side-by-side and collapsing
-  // long unchanged gaps.
+  // long unchanged gaps. Each changed run is one "hunk" (indexed in document
+  // order) so the UI and reconstructWithReverts agree on hunk boundaries.
   const rows: DiffRow[] = [];
   let i = 0;
   let inGap = false;
+  let hunk = 0;
   while (i < tagged.length && rows.length < MAX_ROWS) {
     const t = tagged[i];
     if (t.type === "eq") {
@@ -119,8 +121,10 @@ export function computeDiff(
       rows.push({
         left: d ? { n: d.oldNo!, text: d.text, type: "del" } : undefined,
         right: ad ? { n: ad.newNo!, text: ad.text, type: "add" } : undefined,
+        hunk,
       });
     }
+    hunk++;
   }
 
   return {
@@ -131,6 +135,36 @@ export function computeDiff(
     delCount,
     truncated: rows.length >= MAX_ROWS,
   };
+}
+
+/**
+ * Rebuild a file, reverting only the change blocks (hunks) whose indices are in
+ * `revert`. Mirrors computeDiff's exact run-grouping so a hunk index shown in
+ * the UI maps to the same change block here. Reverted hunks emit the BEFORE
+ * lines; kept hunks emit the AFTER lines.
+ */
+export function reconstructWithReverts(before: string, after: string, revert: Set<number>): string {
+  const a = before.length ? before.split("\n") : [];
+  const b = after.length ? after.split("\n") : [];
+  const ops = lineDiff(a, b);
+  const out: string[] = [];
+  let i = 0;
+  let hunk = 0;
+  while (i < ops.length) {
+    if (ops[i].type === "eq") {
+      out.push(ops[i].text);
+      i++;
+      continue;
+    }
+    const dels: string[] = [];
+    const adds: string[] = [];
+    while (i < ops.length && ops[i].type === "del") dels.push(ops[i++].text);
+    while (i < ops.length && ops[i].type === "add") adds.push(ops[i++].text);
+    if (revert.has(hunk)) out.push(...dels);
+    else out.push(...adds);
+    hunk++;
+  }
+  return out.join("\n");
 }
 
 const EXT_LANG: Record<string, string> = {

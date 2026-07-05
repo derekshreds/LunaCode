@@ -51,6 +51,8 @@ export type AgentEvent =
   | { type: "tool_start"; id: string; name: string; args: any }
   | { type: "tool_end"; id: string; name: string; ok: boolean; summary: string; diff?: import("../webview/protocol").DiffData }
   | { type: "status"; message: string }
+  /** Queued messages were drained into the running turn as steering. */
+  | { type: "steering" }
   | {
       type: "usage";
       usage: Usage;
@@ -103,9 +105,15 @@ export interface AgentDeps {
   /** Session budget check: returns {spent, limit} when the session cost has
    * crossed the configured budget, else null. */
   checkBudget?: () => { spent: number; limit: number } | null;
+  /** Max tool-loop iterations per turn. 0 (or undefined) = unlimited. */
+  maxTurns?: number;
+  /** Stop the turn if the same file/command is mutated more than this many
+   * times — catches runaway "rewrite the same file over and over" loops.
+   * 0/undefined = disabled. */
+  loopGuardLimit?: number;
 }
 
-const MAX_TOOL_ITERATIONS = 50;
+const DEFAULT_MAX_TURNS = 200;
 
 /**
  * Drives a single user turn to completion: streams assistant output, executes
@@ -121,11 +129,39 @@ export class Agent {
   /** Streamed chars this turn (text + reasoning + tool args) for the counter. */
   private streamedChars = 0;
   private lastProgressAt = 0;
+  /** Per-turn count of mutations per target (file/command) — the loop guard. */
+  private editCounts = new Map<string, number>();
 
   constructor(private deps: AgentDeps, private cb: AgentCallbacks) {}
 
   cancel() {
     this.abort?.abort();
+  }
+
+  /** The mutation target(s) a tool call acts on, for loop detection: an edited
+   * file (`file:<path>`) or a run command (`cmd:<command>`). Read-only tools
+   * return none. apply_patch can touch several files. */
+  private mutatingTargets(call: ToolCall): string[] {
+    const name = call.function.name;
+    let args: any = {};
+    try {
+      args = call.function.arguments ? JSON.parse(call.function.arguments) : {};
+    } catch {
+      return [];
+    }
+    if (name === "run_command" || name === "start_process") {
+      const cmd = String(args.command ?? "").trim().slice(0, 100);
+      return cmd ? [`cmd:${cmd}`] : [];
+    }
+    if (name === "write_file" || name === "edit_file") {
+      return args.path ? [`file:${args.path}`] : [];
+    }
+    if (name === "apply_patch") {
+      return Array.isArray(args.changes)
+        ? args.changes.map((c: any) => c?.path).filter(Boolean).map((p: string) => `file:${p}`)
+        : [];
+    }
+    return [];
   }
 
   /** Throttled live-progress counter (covers silent tool-arg streaming). */
@@ -147,7 +183,8 @@ export class Agent {
     this.budgetApproved = false;
     this.streamedChars = 0;
     this.lastProgressAt = 0;
-    this.deps.context.addUser(userText, images);
+    this.editCounts.clear();
+    this.deps.context.addUser(userText, images, { turnStart: true });
     this.cb.onEvent({ type: "turn_start" });
 
     const allowsMutation = MODES[mode].allowsMutation;
@@ -158,8 +195,12 @@ export class Agent {
     this.toolMap = new Map(tools.map((t) => [t.name, t]));
     const toolDefs = toToolDefinitions(tools);
 
+    // 0 = unlimited; undefined falls back to the default cap.
+    const configuredMaxTurns = this.deps.maxTurns ?? DEFAULT_MAX_TURNS;
+    const maxIterations = configuredMaxTurns > 0 ? configuredMaxTurns : Infinity;
+
     try {
-      for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
+      for (let iter = 0; iter < maxIterations; iter++) {
         if (signal.aborted) {
           this.cb.onEvent({ type: "turn_end", stopReason: "cancelled" });
           return;
@@ -195,6 +236,7 @@ export class Agent {
         }
         if (steering.length) {
           this.cb.onEvent({ type: "status", message: "Steering message applied to the running task." });
+          this.cb.onEvent({ type: "steering" });
         }
 
         // Context-budget check. This mutates history only when the budget is
@@ -261,6 +303,7 @@ export class Agent {
           eager.set(idx, this.runToolCall(tc, mode, signal, false));
         };
 
+        let usageSeen = false;
         for await (const ev of this.deps.client.stream({
           messages: this.deps.context.render(),
           tools: toolDefs,
@@ -312,6 +355,7 @@ export class Agent {
               break;
             }
             case "usage":
+              usageSeen = true;
               this.cb.onEvent({
                 type: "usage",
                 usage: ev.usage,
@@ -337,6 +381,29 @@ export class Agent {
                 transient: isTransientFrame(ev.message, ev.code),
               };
               break;
+          }
+        }
+
+        // A turn cancelled mid-stream never receives its usage frame, so the
+        // tokens it already burned would go unbilled. Fetch the real cost from
+        // OpenRouter's /generation record so stopped turns still count.
+        if (!usageSeen && (finishReason === "aborted" || signal.aborted)) {
+          const gid = this.deps.client.generationId;
+          if (gid) {
+            const u = await this.deps.client.fetchGenerationCost(gid);
+            if (u && (u.cost > 0 || u.completion_tokens > 0)) {
+              this.cb.onEvent({
+                type: "usage",
+                usage: {
+                  prompt_tokens: u.prompt_tokens,
+                  completion_tokens: u.completion_tokens,
+                  total_tokens: u.prompt_tokens + u.completion_tokens,
+                  cost: u.cost,
+                },
+                cachedTokens: u.cachedTokens,
+                model: servedModel ?? undefined,
+              });
+            }
           }
         }
 
@@ -378,6 +445,39 @@ export class Agent {
         // arguments are almost certainly truncated. Flag it so the parse-failure
         // message is actionable instead of a cryptic "invalid JSON".
         const truncated = finishReason === "length";
+
+        // Loop guard: catch a runaway turn that keeps rewriting the same file
+        // (or re-running the same command) — a classic second-guessing loop that
+        // burns tokens without progress. Count mutations per target this turn;
+        // when one crosses the limit, backfill results (to keep the tool_call
+        // invariant) and end the turn with a clear message.
+        const limit = this.deps.loopGuardLimit ?? 0;
+        if (limit > 0) {
+          let tripped: string | null = null;
+          for (const c of calls) {
+            for (const sig of this.mutatingTargets(c)) {
+              const n = (this.editCounts.get(sig) ?? 0) + 1;
+              this.editCounts.set(sig, n);
+              if (n > limit) tripped = sig;
+            }
+          }
+          if (tripped) {
+            for (const [idx, call] of entries) {
+              const pending = eager.get(idx);
+              this.deps.context.addToolResult(
+                call.id,
+                pending ? await pending : "Skipped — loop guard stopped this turn."
+              );
+            }
+            const target = tripped.replace(/^(file|cmd):/, "");
+            this.cb.onEvent({
+              type: "status",
+              message: `Stopped: "${target}" was changed ${limit}+ times this turn — looks like a loop. Refine the request, or raise lunacode.loopGuardLimit (0 disables).`,
+            });
+            this.cb.onEvent({ type: "turn_end", stopReason: "loop" });
+            return;
+          }
+        }
 
         // Execute tool calls. Eagerly-started calls just get awaited; other
         // consecutive read-only calls run CONCURRENTLY — the model pays a full
@@ -432,7 +532,7 @@ export class Agent {
       }
       this.cb.onEvent({
         type: "status",
-        message: `Reached the ${MAX_TOOL_ITERATIONS}-step limit for this turn.`,
+        message: `Reached the ${configuredMaxTurns}-step limit for this turn.`,
       });
       this.cb.onEvent({ type: "turn_end", stopReason: "max_iterations" });
     } catch (e: any) {
