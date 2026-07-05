@@ -2,7 +2,7 @@
   "name": "lunacode",
   "displayName": "Luna Code — AI Coding Agent",
   "description": "An agentic coding assistant powered by OpenRouter. Configure with just an API key and a model.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "derekshreds",
   "license": "MIT",
   "repository": {
@@ -235,7 +235,13 @@
         },
         "lunacode.reasoningEffort": {
           "type": "string",
-          "enum": ["default", "off", "low", "medium", "high"],
+          "enum": [
+            "default",
+            "off",
+            "low",
+            "medium",
+            "high"
+          ],
           "enumDescriptions": [
             "Use the model's own default reasoning behavior.",
             "Disable reasoning/thinking entirely.",
@@ -253,7 +259,10 @@
         },
         "lunacode.dataCollection": {
           "type": "string",
-          "enum": ["deny", "allow"],
+          "enum": [
+            "deny",
+            "allow"
+          ],
           "enumDescriptions": [
             "Deny — only route to OpenRouter providers that do NOT store or train on your prompts (recommended for code).",
             "Allow — permit all providers, including ones that may retain or train on data."
@@ -268,7 +277,12 @@
         },
         "lunacode.providerSort": {
           "type": "string",
-          "enum": ["throughput", "latency", "price", "default"],
+          "enum": [
+            "throughput",
+            "latency",
+            "price",
+            "default"
+          ],
           "enumDescriptions": [
             "Throughput — prefer the fastest-generating provider. Fewer 'Upstream idle timeout' stalls on big contexts, but may route to pricier endpoints.",
             "Latency — prefer the provider with the lowest time-to-first-token.",
@@ -282,7 +296,17 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["int4", "int8", "fp4", "fp6", "fp8", "fp16", "bf16", "fp32", "unknown"]
+            "enum": [
+              "int4",
+              "int8",
+              "fp4",
+              "fp6",
+              "fp8",
+              "fp16",
+              "bf16",
+              "fp32",
+              "unknown"
+            ]
           },
           "default": [],
           "description": "Restrict routing to providers serving the model at these quantization levels. Empty = no restriction. To avoid low-precision (fp4) endpoints, list the acceptable levels, e.g. [\"fp8\",\"fp16\",\"bf16\",\"fp32\"] (or just [\"fp8\"] to require exactly fp8). Providers not serving one of the listed quantizations are skipped."
@@ -356,18 +380,24 @@
         "lunacode.customCommands": {
           "type": "object",
           "default": {},
-          "additionalProperties": { "type": "string" },
+          "additionalProperties": {
+            "type": "string"
+          },
           "markdownDescription": "Custom slash commands: `{ \"deploy\": \"Run the deploy checklist: ...\" }` makes `/deploy` expand to that prompt (any text after the command is appended). Built-ins: `/commit`, `/review`, `/tests`."
         },
         "lunacode.fallbackModels": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Models to fall back to (in order) when the primary model errors or is rate-limited, via OpenRouter's models routing. A status line notes when a fallback served the response."
         },
         "lunacode.favoriteModels": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Your preferred model IDs (e.g. \"anthropic/claude-sonnet-5\"). When set, these are shown first in the model quick-pick (with an option to browse the full catalog). Empty = list all models."
         },
@@ -382,11 +412,25 @@
           "markdownDescription": "MCP servers to connect via stdio. Each key is a server name mapping to `{ \"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"], \"env\": { \"GITHUB_TOKEN\": \"…\" } }`. Their tools are exposed to the agent as `mcp__<server>__<tool>` and require approval in Standard mode.",
           "additionalProperties": {
             "type": "object",
-            "required": ["command"],
+            "required": [
+              "command"
+            ],
             "properties": {
-              "command": { "type": "string" },
-              "args": { "type": "array", "items": { "type": "string" } },
-              "env": { "type": "object", "additionalProperties": { "type": "string" } }
+              "command": {
+                "type": "string"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
             }
           }
         },
