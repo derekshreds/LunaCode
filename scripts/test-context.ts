@@ -187,6 +187,62 @@ console.log("No-caching mode:");
   assert(typeof rendered[0].content === "string", "system is plain string when caching disabled");
 }
 
+console.log("Ephemeral tail:");
+{
+  const cm = new ContextManager(true);
+  cm.setSystemPrompt("SYS");
+  cm.addUser("hi");
+  cm.addAssistant({ role: "assistant", content: "answer" });
+  let tail = "# Scratchpad\nGoal: test";
+  cm.setEphemeralTail(() => tail);
+  const rendered = cm.render();
+  const last = rendered[rendered.length - 1];
+  assert(
+    last.role === "user" && typeof last.content === "string" && last.content.includes("Goal: test"),
+    "tail rendered as the final message"
+  );
+  assert(typeof last.content === "string", "tail carries no cache_control part");
+  // The rolling breakpoint stays on the last STORED text-bearing message.
+  const assistant = rendered[rendered.length - 2];
+  const asstHasBp =
+    Array.isArray(assistant.content) && (assistant.content as any[]).some((p) => p.cache_control);
+  assert(asstHasBp, "rolling breakpoint stays on the last stored message");
+  assert(cm.getMessages().length === 2, "tail never enters stored messages (persistence-safe)");
+  // Tail mutations show up on the next render with no prefix change.
+  tail = "# Scratchpad\nGoal: changed";
+  const rendered2 = cm.render();
+  assert(
+    (rendered2[rendered2.length - 1].content as string).includes("changed"),
+    "tail re-renders fresh each call"
+  );
+  assert(
+    JSON.stringify(rendered2.slice(0, -1)) === JSON.stringify(rendered.slice(0, -1)),
+    "prefix bytes identical across tail changes (cache-stable)"
+  );
+  // Empty tail → no extra message.
+  tail = "";
+  const rendered3 = cm.render();
+  assert(rendered3.length === rendered.length - 1, "empty tail appends nothing");
+}
+
+console.log("Self-calibrating estimator:");
+{
+  const cm = new ContextManager(true);
+  cm.setSystemPrompt("S".repeat(4000));
+  cm.addUser("U".repeat(31000));
+  const heuristic = cm.estimate(); // uncalibrated: 35000 chars @ 3.5 cpt
+  cm.noteObservedUsage(35000, 14000); // observed 2.5 chars/token
+  const calibrated = cm.estimate();
+  assert(calibrated > heuristic, `calibration shifts estimate (${heuristic} -> ${calibrated})`);
+  assert(calibrated === Math.ceil(cm.renderChars() / 2.5), "estimate uses observed ratio exactly");
+  // Small/noisy samples are ignored.
+  cm.noteObservedUsage(400, 100);
+  assert(cm.estimate() === calibrated, "sub-4k-token samples ignored");
+  // Absurd ratios are clamped, not adopted verbatim.
+  cm.noteObservedUsage(35000 * 100, 5000);
+  assert(cm.estimate() >= Math.ceil(cm.renderChars() / 5.5), "rogue frame clamped to sane chars/token");
+}
+
 compactionTests()
   .then(() => {
     if (failures) {

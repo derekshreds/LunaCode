@@ -10,16 +10,16 @@ import { ChatMessage, Usage } from "../openrouter/types";
  * plain truncation.
  */
 
-const SUMMARIZER_SYSTEM_PROMPT = `You are a context-compression specialist for an agentic coding session. You will receive a transcript of the older part of a session. Produce a compact checkpoint that lets the coding agent continue seamlessly without the raw history.
+const SUMMARIZER_SYSTEM_PROMPT = `You are a context-compression specialist for a coding session. Compress the older transcript into a compact checkpoint so the agent can continue without the raw history.
 
-Respond in exactly this structure (plain text, no preamble):
-Goal: <the user's original request / current high-level goal>
-Key decisions: <bullet list — each decision and WHY, with concrete file names and symbols>
-Files touched: <bullet list — path plus one line on what was read or changed>
-Errors & tests: <current known failures, test results, unresolved issues; "none known" if none>
+Structure (plain text, no preamble):
+Goal: <current goal>
+Key decisions: <bullet list — each decision & WHY, with file names>
+Files touched: <bullet list — path + what changed>
+Errors & tests: <failures, results; "none known" if none>
 Next step: <what the agent was about to do next>
 
-Be specific and terse. Never invent details that are not in the transcript.`;
+Be extremely terse — 300 tokens max. Never invent details not in the transcript.`;
 
 /** Cap on the serialized transcript sent to the summarizer (~15K tokens). */
 const MAX_TRANSCRIPT_CHARS = 60_000;
@@ -87,7 +87,7 @@ export async function summarizeSpan(
         { role: "user", content: transcript },
       ],
       temperature: 0,
-      maxTokens: 1500,
+      maxTokens: 1024,
       signal: combined,
     });
     if (usage && onUsage) onUsage(usage);

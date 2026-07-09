@@ -5,7 +5,7 @@ import * as path from "path";
 import { execFile } from "child_process";
 import { HostToWebview, WebviewToHost } from "./protocol";
 import { Agent } from "../agent/agent";
-import { ContextManager, estimateTokens } from "../agent/contextManager";
+import { ContextManager } from "../agent/contextManager";
 import { collapseRestoreSet } from "../agent/checkpoints";
 import { computeDiff, reconstructWithReverts } from "../diff";
 import { buildSystemPrompt } from "../agent/systemPrompt";
@@ -14,25 +14,32 @@ import { getConfig, SecretStore } from "../config";
 import { AgentMode, MODES } from "../modes";
 import { ApprovalDecision, ApprovalRequest } from "../agent/tools/types";
 import { IGNORED_DIRS, resolveInWorkspace } from "../agent/tools/util";
-import { toolsForMode, toToolDefinitions } from "../agent/tools";
+import { toolsForPhase, toToolDefinitions } from "../agent/tools";
 import { SessionStore, StoredSession, deriveTitle } from "../sessions";
 import { AssistantMessage, ChatMessage } from "../openrouter/types";
 import { UsageStore } from "../usage";
 import { SessionUsage, SettingsPayload, MentionItem } from "./protocol";
 import { McpManager } from "../mcp/manager";
-import { disposeAllProcesses } from "../agent/tools/backgroundProcess";
+import { disposeAllProcesses, setProcessExitHandler } from "../agent/tools/backgroundProcess";
+import { getRepoMap } from "../agent/repoMap";
+import {
+  StickyMemory,
+  emptyStickyMemory,
+  renderStickyMemory,
+  stickyIsEmpty,
+} from "../agent/stickyMemory";
 
 /** Built-in slash commands. Templates may use $ARGUMENTS (all extra text) and
  * $1..$9 (positional). Custom ones come from lunacode.customCommands and project
  * .luna/commands/*.md files. */
 const SLASH_COMMANDS: Record<string, string> = {
   commit:
-    "Look at the current git status and diff, stage the appropriate files, and create a commit with a well-written conventional commit message. Show the final commit.",
+    "Look at the current git status and diff (prefer git_status and git_diff tools), stage the appropriate files, and create a commit with a well-written conventional commit message. Show the final commit.",
   review:
-    "Review the current working tree changes (git diff plus git diff --staged). Report findings ordered by severity — bugs, then risks, then style — with specific file:line references. Do not change any files.",
+    "Review the current working tree changes (prefer git_diff with both=true). Report findings ordered by severity — bugs, then risks, then style — with specific file:line references. Do not change any files.",
   tests:
     "Run the project's test suite, analyze any failures, fix them, and re-run until everything passes.",
-  pr: "Summarize the changes on the current branch versus the default branch (use git), then draft a pull request title and description (what changed, why, and how to test). Do not push or open the PR unless asked.",
+  pr: "Summarize the changes on the current branch versus the default branch (prefer git_log and git_diff tools), then draft a pull request title and description (what changed, why, and how to test). Do not push or open the PR unless asked.",
   fix: "Investigate and fix the following issue, then verify the fix: $ARGUMENTS",
   explain:
     "Explain how the following code or concept works, concisely and with references to the relevant files: $ARGUMENTS",
@@ -63,8 +70,23 @@ export class LunaCodeController {
   private running = false;
   private pendingApprovals = new Map<string, (d: ApprovalDecision) => void>();
   private approvalSeq = 0;
+  private pendingAskUsers = new Map<string, (answer: string) => void>();
+  private askUserSeq = 0;
   private sessionApprovedKinds = new Set<string>();
   private pendingSelections: string[] = [];
+  /** Session scratchpad that survives compaction. */
+  private stickyMemory: StickyMemory = emptyStickyMemory();
+  /** Cached repo map for the current workspace root. */
+  private repoMapCache: { root: string; text: string; at: number } | null = null;
+  /** Frozen per session (like repoMapCache) so the system prompt stays byte-stable. */
+  private overviewCache: { root: string; text: string } | null = null;
+  /** Project-memory bytes, reused while the underlying files' mtimes are
+   * unchanged — replaces a sync depth-4 walk per turn with a handful of stats. */
+  private projectMemoryCache: {
+    root: string;
+    stamps: Array<{ path: string; mtimeMs: number }>;
+    result: string | undefined;
+  } | null = null;
   /** User messages waiting to run (queued while a turn is active). `echoId` ties
    * a queued message back to its transcript bubble so the rewind button can be
    * attached to it once the turn actually starts. */
@@ -109,6 +131,10 @@ export class LunaCodeController {
    * of the prompt, so a server connecting mid-session must not change the tool
    * array (it would invalidate the entire prompt cache). */
   private sessionMcpTools: import("../agent/tools/types").Tool[] | null = null;
+  /** Progressive-tools phase, carried across turns. The Agent is rebuilt per
+   * turn; without this the phase would reset and flip the tool schema (a full
+   * prompt-cache miss) twice every turn. */
+  private sessionToolPhase: import("../agent/tools").ToolPhase = "read";
   /** Cached workspace file list for @-mention completion. */
   private fileListCache: { files: string[]; at: number } | null = null;
   private prewarmed = "";
@@ -131,11 +157,27 @@ export class LunaCodeController {
     const cfg = getConfig();
     this.mode = cfg.defaultMode;
     this.context = new ContextManager(cfg.enablePromptCaching);
+    // Sticky scratchpad rides in the render-time ephemeral tail (past every
+    // cache breakpoint) so its constant mutation never busts the cached
+    // prefix. The closure reads the live field, so session resets/loads and
+    // mid-turn updates are picked up on the next render with no re-wiring.
+    this.context.setEphemeralTail(() =>
+      stickyIsEmpty(this.stickyMemory) ? "" : renderStickyMemory(this.stickyMemory)
+    );
     this.mcp = new McpManager(output, (m) => this.post({ type: "status", message: m }));
     this.mcp.refresh(cfg.mcpServers);
     this.lastEditor = vscode.window.activeTextEditor;
     this.editorTracker = vscode.window.onDidChangeActiveTextEditor((e) => {
       if (e && e.document.uri.scheme === "file") this.lastEditor = e;
+    });
+    // Warm model metadata so the first turn never waits on /models.
+    this.preloadModelMeta();
+    // Surface background process exits so the agent/user can react without polling.
+    setProcessExitHandler((id, name, code) => {
+      this.post({
+        type: "status",
+        message: `Background process ${name} (${id}) exited with code ${code}.`,
+      });
     });
   }
 
@@ -206,6 +248,15 @@ export class LunaCodeController {
     this.turns = [];
     this.activeCheckpoint = null;
     this.sessionMcpTools = null; // pick up newly-connected MCP servers
+    this.sessionToolPhase = "read";
+    this.stickyMemory = emptyStickyMemory();
+    // New session = new cache prefix anyway; re-read the volatile prompt inputs.
+    this.repoMapCache = null;
+    this.overviewCache = null;
+    this.projectMemoryCache = null;
+    // Reject any in-flight ask_user prompts.
+    for (const [, resolve] of this.pendingAskUsers) resolve("");
+    this.pendingAskUsers.clear();
     this.postCheckpointState();
     this.postRewindState();
     this.post({ type: "sessionReset" });
@@ -213,6 +264,54 @@ export class LunaCodeController {
     void this.maybePrewarm();
     this.post({ type: "sessionUsage", usage: this.sessionUsage });
     void this.sendConfig();
+  }
+
+  /**
+   * Build the system prompt. Every input is frozen per session so the prompt
+   * is byte-identical turn over turn (a stable cache prefix). `refreshVolatile`
+   * re-reads the repo map / overview — pass it only on planned cache misses
+   * (compaction) since any prompt change re-processes the whole prefix.
+   * Project memory is mtime-guarded: an edit to a known LUNA.md refreshes it
+   * (one intentional cache re-write), otherwise the cached bytes are reused.
+   */
+  private async buildPromptForRoot(
+    root: string,
+    opts?: { refreshVolatile?: boolean }
+  ): Promise<string> {
+    let repoMap: string | undefined;
+    try {
+      if (
+        this.repoMapCache &&
+        this.repoMapCache.root === root &&
+        !opts?.refreshVolatile
+      ) {
+        repoMap = this.repoMapCache.text;
+      } else {
+        repoMap = await getRepoMap(root);
+        this.repoMapCache = { root, text: repoMap, at: Date.now() };
+      }
+    } catch {
+      // Keep the stale map rather than dropping the section — a prompt that
+      // flip-flops between builds costs two extra full cache misses.
+      repoMap =
+        this.repoMapCache?.root === root ? this.repoMapCache.text : undefined;
+    }
+    if (
+      !this.overviewCache ||
+      this.overviewCache.root !== root ||
+      opts?.refreshVolatile
+    ) {
+      this.overviewCache = { root, text: this.workspaceOverview(root) };
+    }
+    return buildSystemPrompt({
+      mode: this.mode,
+      workspaceRoot: root,
+      os: `${os.type()} ${os.release()} (${os.platform()})`,
+      shell: os.platform() === "win32" ? "PowerShell" : "sh",
+      workspaceOverview: this.overviewCache.text,
+      repoMap,
+      projectMemory: this.projectMemory(root, !!opts?.refreshVolatile),
+    });
   }
 
   addSelection(text: string, file: string, startLine: number) {
@@ -240,6 +339,8 @@ export class LunaCodeController {
   /** Called when lunacode.* settings change anywhere (settings editor, model
    * QuickPick, the GUI itself) — refreshes the model chip and any open sheet. */
   onConfigChanged() {
+    // Model may have changed — make sure its metadata is warm before the next turn.
+    this.preloadModelMeta();
     void this.sendConfig();
     this.sendSettings();
     this.mcp.refresh(getConfig().mcpServers);
@@ -270,6 +371,14 @@ export class LunaCodeController {
         }
         break;
       }
+      case "askUserResponse": {
+        const resolver = this.pendingAskUsers.get(msg.id);
+        if (resolver) {
+          this.pendingAskUsers.delete(msg.id);
+          resolver(msg.answer ?? "");
+        }
+        break;
+      }
       case "newSession":
         this.newSession();
         break;
@@ -278,6 +387,9 @@ export class LunaCodeController {
         break;
       case "selectModel":
         await vscode.commands.executeCommand("lunacode.selectModel");
+        break;
+      case "selectSubagentModel":
+        await vscode.commands.executeCommand("lunacode.selectSubagentModel");
         break;
       case "listSessions":
         this.sendSessionList();
@@ -355,12 +467,18 @@ export class LunaCodeController {
         model: cfg.model,
         summarizerModel: cfg.summarizerModel,
         subagentModel: cfg.subagentModel,
+        plannerModel: cfg.plannerModel,
+        implementerModel: cfg.implementerModel,
+        subagentMaxContextTokens: cfg.subagentMaxContextTokens,
+        progressiveTools: cfg.progressiveTools,
+        adaptiveReasoning: cfg.adaptiveReasoning,
         fallbackModels: cfg.fallbackModels,
         favoriteModels: cfg.favoriteModels,
         prewarmCache: cfg.prewarmCache,
         maxContextTokens: cfg.maxContextTokens,
         autoBudgetCarryCostUsd: cfg.autoBudgetCarryCostUsd,
         compactionTargetRatio: cfg.compactionTargetRatio,
+        microcompactRatio: cfg.microcompactRatio,
         maxTokens: cfg.maxTokens,
         temperature: cfg.temperature,
         enablePromptCaching: cfg.enablePromptCaching,
@@ -392,6 +510,11 @@ export class LunaCodeController {
     "model",
     "summarizerModel",
     "subagentModel",
+    "plannerModel",
+    "implementerModel",
+    "subagentMaxContextTokens",
+    "progressiveTools",
+    "adaptiveReasoning",
     "fallbackModels",
     "favoriteModels",
     "prewarmCache",
@@ -406,6 +529,7 @@ export class LunaCodeController {
     "maxContextTokens",
     "autoBudgetCarryCostUsd",
     "compactionTargetRatio",
+    "microcompactRatio",
     "maxTokens",
     "temperature",
     "enablePromptCaching",
@@ -480,6 +604,10 @@ export class LunaCodeController {
     this.currentCreatedAt = s.createdAt;
     this.mode = s.mode;
     this.sessionMcpTools = null;
+    // A resumed session starts from a cold provider cache regardless, so begin
+    // at the full tool set — a later mid-session unlock would cost a full
+    // cache miss at a much larger context.
+    this.sessionToolPhase = s.messages.length > 0 ? "all" : "read";
     this.activeCheckpoint = null;
 
     // Rebuild the turn ledger from persisted anchors (with a legacy fallback),
@@ -509,6 +637,20 @@ export class LunaCodeController {
     };
     this.post({ type: "sessionReset" });
     await this.sendConfig();
+    // Restore sticky memory from the persisted session, falling back to empty.
+    this.stickyMemory = s.stickyMemory
+      ? { ...emptyStickyMemory(), ...s.stickyMemory, decisions: s.stickyMemory.decisions ?? [], filesTouched: s.stickyMemory.filesTouched ?? [], openErrors: s.stickyMemory.openErrors ?? [], commands: s.stickyMemory.commands ?? {} }
+      : emptyStickyMemory();
+    // Rebuild the system prompt for the restored session's mode/root. (Sticky
+    // memory needs no injection — the ephemeral-tail closure reads the live
+    // field restored above.)
+    try {
+      const root = this.workspaceRoot();
+      if (root) this.context.setSystemPrompt(await this.buildPromptForRoot(root));
+    } catch {
+      /* best-effort */
+    }
+
     this.post({ type: "sessionUsage", usage: this.sessionUsage });
     const rewindIdByIndex = new Map(starts.map((st) => [st.index, st.id]));
     for (const ev of messagesToEvents(s.messages, rewindIdByIndex)) {
@@ -555,6 +697,7 @@ export class LunaCodeController {
       messages: msgs,
       usage: this.sessionUsage,
       turns: this.serializeTurns(),
+      stickyMemory: this.stickyMemory,
     };
     try {
       await this.sessions.save(session);
@@ -620,12 +763,62 @@ export class LunaCodeController {
     this.post({ type: "status", message: `Working folder: ${picked.label}` });
   }
 
+  /** Fixed candidate locations always stamped for project-memory freshness —
+   * statting these catches newly CREATED root memory files, not just edits. */
+  private memoryStampPaths(root: string): string[] {
+    return [
+      path.join(os.homedir(), ".lunacode", "LUNA.md"),
+      path.join(root, "LUNA.md"),
+      path.join(root, "AGENTS.md"),
+      path.join(root, "CLAUDE.md"),
+      path.join(root, ".cursorrules"),
+      path.join(root, ".cursor", "rules"),
+    ];
+  }
+
+  private mtimeOf(p: string): number {
+    try {
+      return fs.statSync(p).mtimeMs;
+    } catch {
+      return -1;
+    }
+  }
+
+  /**
+   * Project memory with an mtime guard: while every known memory file is
+   * unchanged, return the cached bytes (keeps the system prompt byte-stable
+   * AND skips the sync directory walk). When the agent edits a LUNA.md the
+   * stamp mismatch forces a rebuild — one intentional cache re-write, then
+   * the new prefix is stable again. Newly created NESTED memory files are
+   * only discovered on `refresh` (session start / compaction) — acceptable
+   * staleness for cache stability.
+   */
+  private projectMemory(root: string, refresh: boolean): string | undefined {
+    const cache = this.projectMemoryCache;
+    if (
+      !refresh &&
+      cache &&
+      cache.root === root &&
+      cache.stamps.every((s) => this.mtimeOf(s.path) === s.mtimeMs)
+    ) {
+      return cache.result;
+    }
+    const collected: string[] = [];
+    const result = this.readProjectMemory(root, collected);
+    const stampPaths = [...new Set([...this.memoryStampPaths(root), ...collected])];
+    this.projectMemoryCache = {
+      root,
+      stamps: stampPaths.map((p) => ({ path: p, mtimeMs: this.mtimeOf(p) })),
+      result,
+    };
+    return result;
+  }
+
   /** Project memory: LUNA.md at the workspace root plus nested LUNA.md files
    * in subdirectories (monorepo packages), capped so memory can't blow up the
-   * (cached) system prompt. Re-read each turn — if the agent updates one
-   * mid-session, the next turn pays one cache re-write and then the new
-   * prefix is stable again. */
-  private readProjectMemory(root: string): string | undefined {
+   * (cached) system prompt. `collect` receives every file actually read so the
+   * caller can mtime-stamp them for cache freshness. */
+  private readProjectMemory(root: string, collect?: string[]): string | undefined {
     const sections: string[] = [];
     const clip = (text: string, max: number, label = "") =>
       text.length > max ? text.slice(0, max) + `\n…[${label || "truncated"}]` : text;
@@ -634,6 +827,7 @@ export class LunaCodeController {
     try {
       const globalFile = path.join(os.homedir(), ".lunacode", "LUNA.md");
       if (fs.existsSync(globalFile)) {
+        collect?.push(globalFile);
         const text = fs.readFileSync(globalFile, "utf8").trim();
         if (text) sections.push("### Global rules (~/.lunacode/LUNA.md)\n" + clip(text, 4000));
       }
@@ -647,6 +841,7 @@ export class LunaCodeController {
       const ROOT_NAMES = ["LUNA.md", "AGENTS.md", "CLAUDE.md", ".cursorrules"];
       const rootName = ROOT_NAMES.find((n) => fs.existsSync(path.join(root, n)));
       if (rootName) {
+        collect?.push(path.join(root, rootName));
         const text = fs.readFileSync(path.join(root, rootName), "utf8").trim();
         if (text) {
           const body = clip(text, 6000, `${rootName} truncated`);
@@ -662,6 +857,7 @@ export class LunaCodeController {
           .sort()
           .slice(0, 4);
         for (const f of files) {
+          collect?.push(path.join(rulesDir, f));
           const text = fs.readFileSync(path.join(rulesDir, f), "utf8").trim();
           if (text) sections.push(`### .cursor/rules/${f}\n` + clip(text, 1500));
         }
@@ -691,6 +887,7 @@ export class LunaCodeController {
       walk(root, 0);
       for (const abs of nested) {
         try {
+          collect?.push(abs);
           const text = fs.readFileSync(abs, "utf8").trim();
           if (!text) continue;
           const rel = abs.slice(root.length + 1);
@@ -805,16 +1002,9 @@ export class LunaCodeController {
     if (cfg.worktreeMode) root = await this.ensureSandbox(root);
 
     this.context.setCaching(cfg.enablePromptCaching);
-    this.context.setSystemPrompt(
-      buildSystemPrompt({
-        mode: this.mode,
-        workspaceRoot: root,
-        os: `${os.type()} ${os.release()} (${os.platform()})`,
-        shell: os.platform() === "win32" ? "PowerShell" : "sh",
-        workspaceOverview: this.workspaceOverview(root),
-        projectMemory: this.readProjectMemory(root),
-      })
-    );
+    const applyPrompt = async (opts?: { refreshVolatile?: boolean }) => {
+      this.context.setSystemPrompt(await this.buildPromptForRoot(root!, opts));
+    };
 
     this.activeModel = cfg.model;
     const client = new OpenRouterClient({
@@ -828,6 +1018,13 @@ export class LunaCodeController {
       reasoningEffort: cfg.reasoningEffort === "default" ? undefined : cfg.reasoningEffort,
     });
 
+    // Prompt build and budget calc are independent — overlap them (the budget
+    // may hit /models on a cold cache).
+    const [, maxContextTokens] = await Promise.all([
+      applyPrompt(),
+      this.effectiveContextBudget(cfg, client),
+    ]);
+
     this.agent = new Agent(
       {
         client,
@@ -836,10 +1033,22 @@ export class LunaCodeController {
         workspaceRoot: root,
         maxTokens: cfg.maxTokens,
         temperature: cfg.temperature,
-        maxContextTokens: await this.effectiveContextBudget(cfg, client),
+        maxContextTokens,
         summarizerModel: cfg.summarizerModel || cfg.model,
         compactionTargetRatio: cfg.compactionTargetRatio,
+        microcompactRatio: cfg.microcompactRatio,
         subagentModel: cfg.subagentModel,
+        plannerModel: cfg.plannerModel || cfg.subagentModel,
+        implementerModel: cfg.implementerModel,
+        subagentMaxContextTokens: cfg.subagentMaxContextTokens,
+        progressiveTools: cfg.progressiveTools,
+        initialToolPhase: this.sessionToolPhase,
+        onToolPhaseChange: (phase) => {
+          this.sessionToolPhase = phase;
+        },
+        adaptiveReasoning: cfg.adaptiveReasoning,
+        reasoningEffort:
+          cfg.reasoningEffort === "default" ? undefined : cfg.reasoningEffort,
         maxTurns: cfg.maxTurns,
         loopGuardLimit: cfg.loopGuardLimit,
         snapshotFile: (relPath) => this.snapshotFile(root, relPath),
@@ -847,6 +1056,10 @@ export class LunaCodeController {
         // Mid-turn steering: the agent drains queued messages each iteration.
         takeSteering: () => this.queue.splice(0, this.queue.length),
         formatAfterEdit: cfg.formatAfterEdit,
+        stickyMemory: this.stickyMemory,
+        // Called at compaction — a planned cache miss — so refreshing the
+        // volatile prompt inputs (repo map, project memory) there is free.
+        refreshSystemPrompt: () => applyPrompt({ refreshVolatile: true }),
         checkBudget: () => {
           const limit = getConfig().sessionBudgetUsd;
           return limit > 0 && this.sessionUsage.cost >= limit
@@ -857,6 +1070,7 @@ export class LunaCodeController {
       {
         onEvent: (e) => this.forwardEvent(e),
         requestApproval: (req) => this.askApproval(req),
+        askUser: (req) => this.askUser(req),
       }
     );
 
@@ -1320,48 +1534,26 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
   private async sendContextInfo() {
     const cfg = getConfig();
     const root = this.workspaceRoot();
-    const messages = this.context.getMessages();
-    const systemTokens = Math.ceil(
-      (root
-        ? buildSystemPrompt({
-            mode: this.mode,
-            workspaceRoot: root,
-            os: `${os.type()} ${os.release()} (${os.platform()})`,
-            shell: os.platform() === "win32" ? "PowerShell" : "sh",
-            workspaceOverview: this.workspaceOverview(root),
-            projectMemory: this.readProjectMemory(root),
-          }).length
-        : 0) / 4
-    );
-    const sized = messages.map((m, i) => ({
-      i,
-      role: m.role,
-      tokens: estimateTokens([m]),
-      preview: (typeof m.content === "string" ? m.content : "")
-        .replace(/\s+/g, " ")
-        .slice(0, 70),
-    }));
-    const totalTokens = systemTokens + sized.reduce((a, m) => a + m.tokens, 0);
-    const client = new OpenRouterClient({
-      apiKey: "", // unused — only need the budget calculation
-      baseUrl: cfg.baseUrl,
-      model: cfg.model,
-    });
-    const budget = await this.effectiveContextBudget(cfg, client);
+    // Ensure the system prompt matches what the next turn would send so the
+    // breakdown's systemTokens line is accurate.
+    if (root) {
+      this.context.setSystemPrompt(await this.buildPromptForRoot(root));
+    }
+    const bd = this.context.breakdown();
+    const budget = await this.effectiveContextBudget(cfg);
     const price = this.lookupModelMeta(cfg.model)?.promptPrice;
     this.post({
       type: "contextInfo",
       info: {
-        totalTokens,
+        totalTokens: bd.totalTokens,
         budget,
-        systemTokens,
-        messageCount: messages.length,
-        hasMemory: !!(root && this.readProjectMemory(root)),
-        nextCallCostUsd: price ? totalTokens * price * 0.1 : undefined,
-        largest: sized
-          .sort((a, b) => b.tokens - a.tokens)
-          .slice(0, 6)
-          .map(({ role, preview, tokens }) => ({ role, preview, tokens })),
+        systemTokens: bd.systemTokens,
+        messageCount: bd.messageCount,
+        hasMemory: !!(root && this.projectMemory(root, false)),
+        nextCallCostUsd: price ? bd.totalTokens * price * 0.1 : undefined,
+        largest: bd.largest,
+        byRole: bd.byRole,
+        stubbedToolResults: bd.stubbedToolResults,
       },
     });
   }
@@ -1674,16 +1866,7 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
     if (this.prewarmed === key) return;
     this.prewarmed = key;
     const tmp = new ContextManager(true);
-    tmp.setSystemPrompt(
-      buildSystemPrompt({
-        mode: this.mode,
-        workspaceRoot: root,
-        os: `${os.type()} ${os.release()} (${os.platform()})`,
-        shell: os.platform() === "win32" ? "PowerShell" : "sh",
-        workspaceOverview: this.workspaceOverview(root),
-        projectMemory: this.readProjectMemory(root),
-      })
-    );
+    tmp.setSystemPrompt(await this.buildPromptForRoot(root));
     tmp.addUser("Reply with exactly: ok");
     const client = new OpenRouterClient({
       apiKey,
@@ -1696,8 +1879,13 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
       reasoningEffort: cfg.reasoningEffort === "default" ? undefined : cfg.reasoningEffort,
     });
     const allowsMutation = MODES[this.mode].allowsMutation;
+    // Mirror the first real call's tool set exactly — with progressive tools
+    // on, that's the read/meta phase; prewarming the full set would never match.
+    const progressive =
+      cfg.progressiveTools && allowsMutation && this.mode !== "plan";
+    const phase = progressive ? this.sessionToolPhase : "all";
     const tools = [
-      ...toolsForMode(!allowsMutation),
+      ...toolsForPhase(!allowsMutation, phase),
       ...(this.sessionMcpTools ??= this.mcp.getTools()).filter(
         (t) => allowsMutation || !t.mutating
       ),
@@ -1719,17 +1907,21 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
    */
   private async effectiveContextBudget(
     cfg: ReturnType<typeof getConfig>,
-    client: OpenRouterClient
+    client?: OpenRouterClient
   ): Promise<number> {
     if (cfg.maxContextTokens > 0) return cfg.maxContextTokens;
     let meta = this.lookupModelMeta(cfg.model);
     if (!meta) {
-      // Wait (briefly) for /models so the first turn of a session already
-      // runs with the real window instead of the 180k fallback. A hung
-      // fetch never blocks the turn — the load keeps going in the
-      // background and later turns pick it up.
+      // Usually warm already (preloadModelMeta runs at startup / on config
+      // change). Cold-cache fallback: wait briefly for /models so the first
+      // turn runs with the real window instead of the 180k fallback. A hung
+      // fetch never blocks the turn — the load keeps going in the background
+      // and later turns pick it up.
+      const metaClient =
+        client ??
+        new OpenRouterClient({ apiKey: "", baseUrl: cfg.baseUrl, model: cfg.model });
       await Promise.race([
-        this.loadModelMeta(client, cfg.model),
+        this.loadModelMeta(metaClient, cfg.model),
         new Promise((r) => setTimeout(r, 2500)),
       ]);
       meta = this.lookupModelMeta(cfg.model);
@@ -1749,6 +1941,18 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
    * ":thinking") that the /models list may key differently. */
   private lookupModelMeta(model: string) {
     return this.modelMeta.get(model) ?? this.modelMeta.get(model.split(":")[0]);
+  }
+
+  /** Warm the model-metadata cache in the background so the first turn's
+   * budget calculation never blocks on /models (it raced up to 2.5s). */
+  private preloadModelMeta() {
+    const cfg = getConfig();
+    const client = new OpenRouterClient({
+      apiKey: "", // /models needs no auth; metadata only
+      baseUrl: cfg.baseUrl,
+      model: cfg.model,
+    });
+    void this.loadModelMeta(client, cfg.model).catch(() => {});
   }
 
   /** Fetch model metadata, deduped across concurrent callers. Re-fetches (at
@@ -1808,6 +2012,20 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
           diff: req.diff,
           diffs: req.diffs,
         },
+      });
+    });
+  }
+
+  /** Pause the agent for a clarifying question (ask_user tool). */
+  private askUser(req: { question: string; options?: string[] }): Promise<string> {
+    const id = `ask_${this.askUserSeq++}`;
+    return new Promise<string>((resolve) => {
+      this.pendingAskUsers.set(id, resolve);
+      this.post({
+        type: "askUserRequest",
+        id,
+        question: req.question,
+        options: req.options,
       });
     });
   }
@@ -1910,6 +2128,14 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
         this.sessionUsage = {
           ...this.sessionUsage,
           compactions: (this.sessionUsage.compactions ?? 0) + 1,
+          tokensSaved: (this.sessionUsage.tokensSaved ?? 0) + e.tokensSaved,
+        };
+        this.post({ type: "sessionUsage", usage: this.sessionUsage });
+        break;
+      case "microcompact":
+        // Count toward tokensSaved so the meter reflects soft cleanups too.
+        this.sessionUsage = {
+          ...this.sessionUsage,
           tokensSaved: (this.sessionUsage.tokensSaved ?? 0) + e.tokensSaved,
         };
         this.post({ type: "sessionUsage", usage: this.sessionUsage });

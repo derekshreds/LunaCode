@@ -115,6 +115,10 @@ export interface ContextInfo {
   /** Estimated $ for the next fully-cached call (undefined if price unknown). */
   nextCallCostUsd?: number;
   largest: { role: string; preview: string; tokens: number }[];
+  /** Token totals by message role (system/user/assistant/tool). */
+  byRole?: { role: string; tokens: number; count: number }[];
+  /** Tool results already stubbed as superseded/stale/truncated. */
+  stubbedToolResults?: number;
 }
 
 /** All GUI-editable settings, mirroring the lunacode.* configuration keys. */
@@ -122,12 +126,18 @@ export interface SettingsPayload {
   model: string;
   summarizerModel: string;
   subagentModel: string;
+  plannerModel: string;
+  implementerModel: string;
+  subagentMaxContextTokens: number;
+  progressiveTools: boolean;
+  adaptiveReasoning: boolean;
   fallbackModels: string[];
   favoriteModels: string[];
   prewarmCache: boolean;
   maxContextTokens: number;
   autoBudgetCarryCostUsd: number;
   compactionTargetRatio: number;
+  microcompactRatio: number;
   maxTokens: number;
   temperature: number;
   enablePromptCaching: boolean;
@@ -193,6 +203,13 @@ export type HostToWebview =
   | { type: "error"; message: string }
   | { type: "turnEnd"; stopReason: string }
   | { type: "approvalRequest"; payload: ApprovalPayload }
+  /** Clarifying question from the ask_user tool. */
+  | {
+      type: "askUserRequest";
+      id: string;
+      question: string;
+      options?: string[];
+    }
   | { type: "sessionReset" }
   | { type: "userEcho"; text: string; queued?: boolean; echoId?: number; rewindId?: number }
   | {
@@ -242,9 +259,11 @@ export type WebviewToHost =
   | { type: "cancel" }
   | { type: "setMode"; mode: AgentMode }
   | { type: "approvalResponse"; id: string; decision: "approved" | "rejected" | "approved-always" }
+  | { type: "askUserResponse"; id: string; answer: string }
   | { type: "newSession" }
   | { type: "setApiKey" }
   | { type: "selectModel" }
+  | { type: "selectSubagentModel" }
   | { type: "listSessions" }
   | { type: "loadSession"; id: string }
   | { type: "deleteSession"; id: string }

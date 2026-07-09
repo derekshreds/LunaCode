@@ -18,6 +18,21 @@ interface BgProc {
   /** Ring buffer of combined stdout+stderr. */
   buffer: string;
   exited: number | null; // exit code once done
+  exitedAt: number | null; // timestamp when process exited
+  exitNotified: boolean; // whether the exit callback has been called
+}
+
+/**
+ * Callback invoked when a background process exits.
+ * Receives (id, name, exitCode).
+ */
+export let onProcessExit: ((id: string, name: string, code: number) => void) | null = null;
+
+/**
+ * Register a handler for background process exits.
+ */
+export function setProcessExitHandler(handler: typeof onProcessExit): void {
+  onProcessExit = handler;
 }
 
 const MAX_PROCESSES = 5;
@@ -43,8 +58,9 @@ function statusLine(p: BgProc): string {
 
 export const startProcessTool: Tool = {
   name: "start_process",
+  group: "exec",
   description:
-    "Start a LONG-RUNNING command in the background (dev server, watcher, tail). Returns a process id immediately plus the first moments of output. Use read_process to check its output later and stop_process when done. For commands that finish on their own, use run_command instead.",
+    "Start a long-running background command (dev server, watcher). Returns process id + initial output.",
   mutating: true,
   parameters: {
     type: "object",
@@ -94,6 +110,8 @@ export const startProcessTool: Tool = {
       proc,
       buffer: "",
       exited: null,
+      exitedAt: null,
+      exitNotified: false,
     };
     const append = (chunk: Buffer) => {
       const s = chunk.toString("utf8");
@@ -105,10 +123,22 @@ export const startProcessTool: Tool = {
     };
     proc.stdout?.on("data", append);
     proc.stderr?.on("data", append);
-    proc.on("exit", (code) => (entry.exited = code ?? -1));
+    proc.on("exit", (code) => {
+      entry.exited = code ?? -1;
+      entry.exitedAt = Date.now();
+      if (!entry.exitNotified) {
+        entry.exitNotified = true;
+        onProcessExit?.(entry.id, entry.name, entry.exited);
+      }
+    });
     proc.on("error", (e) => {
       entry.buffer += `\n[spawn error: ${e.message}]`;
       entry.exited = -1;
+      entry.exitedAt = Date.now();
+      if (!entry.exitNotified) {
+        entry.exitNotified = true;
+        onProcessExit?.(entry.id, entry.name, entry.exited);
+      }
     });
     processes.set(id, entry);
 
@@ -126,13 +156,14 @@ export const startProcessTool: Tool = {
 export const readProcessTool: Tool = {
   name: "read_process",
   description:
-    "Read the recent output of a background process started with start_process. With no id, lists all background processes and their status.",
+    "Read recent output of a background process. Omit id to list all.",
   mutating: false,
+  group: "read",
   parameters: {
     type: "object",
     properties: {
-      id: { type: "string", description: "Process id from start_process (optional — omit to list all)." },
-      tail_chars: { type: "number", description: "How much of the latest output to return (default 4000)." },
+      id: { type: "string", description: "Process id (omit to list all)." },
+      tail_chars: { type: "number", description: "Latest output chars to return (default 2500)." },
     },
   },
   async execute(args): Promise<ToolResult> {
@@ -144,7 +175,7 @@ export const readProcessTool: Tool = {
     }
     const p = processes.get(args.id);
     if (!p) return { content: `No such process: ${args.id}`, isError: true };
-    const tail = Math.min(Math.max(args.tail_chars ?? 4000, 200), 20_000);
+    const tail = Math.min(Math.max(args.tail_chars ?? 2500, 200), 12_000);
     const out = p.buffer.slice(-tail);
     return {
       content: `${statusLine(p)}\n--- latest output ---\n${out || "(no output)"}`,
@@ -154,8 +185,9 @@ export const readProcessTool: Tool = {
 
 export const stopProcessTool: Tool = {
   name: "stop_process",
-  description: "Stop a background process started with start_process.",
+  description: "Stop a background process by id.",
   mutating: true,
+  group: "exec",
   parameters: {
     type: "object",
     properties: {
@@ -179,3 +211,18 @@ export const stopProcessTool: Tool = {
     return { content: `Stopped ${p.name} (${args.id}).` };
   },
 };
+
+/**
+ * Return processes that exited within the last `sinceMs` milliseconds.
+ * Useful for the agent to poll for recently-failed background processes.
+ */
+export function listExitedSince(sinceMs: number): Array<{ id: string; name: string; code: number }> {
+  const cutoff = Date.now() - sinceMs;
+  const result: Array<{ id: string; name: string; code: number }> = [];
+  for (const p of processes.values()) {
+    if (p.exited !== null && p.exitedAt !== null && p.exitedAt >= cutoff) {
+      result.push({ id: p.id, name: p.name, code: p.exited });
+    }
+  }
+  return result;
+}

@@ -92,6 +92,8 @@ export interface CompletionParams {
   signal?: AbortSignal;
   /** Override the client's configured model for this call (e.g. summarizer). */
   model?: string;
+  /** Per-call reasoning effort override (adaptive routing). */
+  reasoningEffort?: "off" | "low" | "medium" | "high";
 }
 
 /**
@@ -197,7 +199,7 @@ export class OpenRouterClient {
         ...(this.opts.providerSort ? { sort: this.opts.providerSort } : {}),
         ...(this.opts.quantizations?.length ? { quantizations: this.opts.quantizations } : {}),
       },
-      reasoning: reasoningParam(this.opts.reasoningEffort),
+      reasoning: reasoningParam(params.reasoningEffort ?? this.opts.reasoningEffort),
       zdr: this.opts.zdr ? true : undefined,
     };
 

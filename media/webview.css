@@ -122,12 +122,14 @@ body {
 /* ---------- Messages ---------- */
 .messages {
   flex: 1;
+  min-height: 0; /* allow flex child to shrink so overflow-y actually scrolls */
   overflow-y: auto;
   padding: 22px 26px;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  scroll-behavior: smooth;
+  /* No scroll-behavior: smooth — programmatic stick-to-bottom during streaming
+     must jump instantly; smooth animations lag and leave us off-bottom. */
 }
 .messages::-webkit-scrollbar {
   width: 8px;

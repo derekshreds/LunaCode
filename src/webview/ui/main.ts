@@ -48,7 +48,7 @@ const state: UiState = {
   fallback: "",
 };
 
-let currentAssistant: { el: HTMLElement; raw: string } | null = null;
+let currentAssistant: { el: HTMLElement; raw: string; renderQueued?: boolean } | null = null;
 /** The live collapsible "thinking" block for the current step, if any. */
 let currentReasoning: { details: HTMLDetailsElement; body: HTMLElement; raw: string } | null = null;
 /** Model driving the current turn — stamped onto each assistant block as a badge. */
@@ -334,34 +334,121 @@ function setRunning(running: boolean) {
 // ---------- Scroll ----------
 // Stick-to-bottom: only auto-scroll while the user is already near the bottom.
 // Scrolling up to read pauses following; scrolling back down resumes it.
+//
+// Important: do NOT use CSS `scroll-behavior: smooth` on #messages. Smooth
+// animations lag behind streaming growth, leave us a few px short of the
+// bottom, and the scroll handler then clears stickToBottom — so following
+// silently dies mid-stream. Instant scrollTop jumps stay glued.
+//
+// Content growth (thinking rows, markdown, tool cards) does not fire a
+// viewport resize. We ResizeObserver each message child so any height change
+// re-pins while stickToBottom is set — that covers the "thinking block popped
+// in and left a gap under the fold" case.
 let stickToBottom = true;
+let scrollRaf = 0;
+let userScrolling = false;
+let userScrollIdleTimer = 0;
+const NEAR_BOTTOM_PX = 80;
+
 function nearBottom(): boolean {
-  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 60;
+  return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < NEAR_BOTTOM_PX;
 }
+
+function endUserScroll() {
+  userScrolling = false;
+  if (nearBottom()) stickToBottom = true;
+}
+
+function markUserScroll() {
+  userScrolling = true;
+  window.clearTimeout(userScrollIdleTimer);
+  userScrollIdleTimer = window.setTimeout(endUserScroll, 150);
+}
+
 messagesEl.addEventListener("scroll", () => {
-  stickToBottom = nearBottom();
+  // While the user is actively wheeling/touching, trust nearBottom().
+  // Programmatic pins also fire `scroll`; if a pin lands slightly short
+  // (layout still settling) we must NOT clear stickToBottom or following dies.
+  if (userScrolling) stickToBottom = nearBottom();
+  else if (nearBottom()) stickToBottom = true;
 });
-// The scroll event above is async, so during rapid streaming a scrollToBottom()
-// can snap back before it registers a scroll-up. Wheel/touch fire synchronously
-// with the user's intent, so release stick immediately when they scroll up.
+// scroll is async; during rapid streaming a pin can run before a scroll-up
+// registers. Wheel/touch fire with the user's intent, so update stick now.
 messagesEl.addEventListener(
   "wheel",
   (e: WheelEvent) => {
+    markUserScroll();
     if (e.deltaY < 0) stickToBottom = false;
+    else if (e.deltaY > 0 && nearBottom()) stickToBottom = true;
+  },
+  { passive: true }
+);
+messagesEl.addEventListener(
+  "touchstart",
+  () => {
+    markUserScroll();
+  },
+  { passive: true }
+);
+messagesEl.addEventListener(
+  "touchend",
+  () => {
+    endUserScroll();
   },
   { passive: true }
 );
 messagesEl.addEventListener(
   "touchmove",
   () => {
-    stickToBottom = nearBottom();
+    markUserScroll();
+    requestAnimationFrame(() => {
+      stickToBottom = nearBottom();
+    });
   },
   { passive: true }
 );
+
+function pinToBottom() {
+  // Overscroll assignment clamps to the max; cheaper and more reliable than
+  // reading scrollHeight twice across frames when layout is still settling.
+  messagesEl.scrollTop = messagesEl.scrollHeight + 1e6;
+}
+
 function scrollToBottom(force = false) {
-  if (!force && !stickToBottom) return;
   if (force) stickToBottom = true;
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  else if (!stickToBottom) return;
+  // Coalesce streaming deltas to one pin per frame, after layout.
+  if (scrollRaf) cancelAnimationFrame(scrollRaf);
+  scrollRaf = requestAnimationFrame(() => {
+    scrollRaf = 0;
+    if (!stickToBottom) return;
+    pinToBottom();
+    // One more frame: thinking/tool rows often finalize height post-paint
+    // (summary text, borders, fonts). If we're still following, pin again.
+    requestAnimationFrame(() => {
+      if (stickToBottom) pinToBottom();
+    });
+  });
+}
+
+// Re-pin when the viewport resizes (activity bar, approval card, sidebar) OR
+// when any message child's border-box grows (thinking block, streamed md…).
+if (typeof ResizeObserver !== "undefined") {
+  const reflowPin = () => {
+    if (stickToBottom) pinToBottom();
+  };
+  const ro = new ResizeObserver(reflowPin);
+  ro.observe(messagesEl);
+  new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      m.addedNodes.forEach((n) => {
+        if (n instanceof HTMLElement) ro.observe(n);
+      });
+      m.removedNodes.forEach((n) => {
+        if (n instanceof HTMLElement) ro.unobserve(n);
+      });
+    }
+  }).observe(messagesEl, { childList: true });
 }
 
 // ---------- Messages ----------
@@ -494,7 +581,7 @@ function clearQueuedTags() {
   });
 }
 
-function ensureAssistant(): { el: HTMLElement; raw: string } {
+function ensureAssistant(): NonNullable<typeof currentAssistant> {
   if (!currentAssistant) {
     clearWelcome();
     const wrap = el("div", "msg assistant enter");
@@ -513,9 +600,18 @@ function ensureAssistant(): { el: HTMLElement; raw: string } {
 function appendAssistantText(delta: string) {
   const a = ensureAssistant();
   a.raw += delta;
-  a.el.innerHTML = renderMarkdown(a.raw);
-  markClippedCode(a.el);
-  scrollToBottom();
+  // Re-parsing the WHOLE message per delta is O(n²) over a long stream — one
+  // render per frame is visually identical. The rAF captures this message
+  // object, so the final delta always paints even if the turn ends (and
+  // currentAssistant is cleared) before the frame fires.
+  if (a.renderQueued) return;
+  a.renderQueued = true;
+  requestAnimationFrame(() => {
+    a.renderQueued = false;
+    a.el.innerHTML = renderMarkdown(a.raw);
+    markClippedCode(a.el);
+    scrollToBottom();
+  });
 }
 
 // ---------- Capped code previews ----------
@@ -641,6 +737,9 @@ function ensureReasoning(): { details: HTMLDetailsElement; body: HTMLElement; ra
     details.appendChild(body);
     messagesEl.appendChild(details);
     currentReasoning = { details, body, raw: "" };
+    // The summary row itself takes space even when collapsed — pin so it
+    // doesn't land below the fold while the user is following the bottom.
+    scrollToBottom();
   }
   return currentReasoning;
 }
@@ -648,7 +747,8 @@ function appendReasoning(delta: string) {
   const r = ensureReasoning();
   r.raw += delta;
   r.body.textContent = r.raw;
-  // Collapsed thinking isn't visible, so don't fight the user's scroll position.
+  // Collapsed thinking isn't visible, so don't fight the user's scroll position
+  // on every delta — only follow while the block is expanded.
   if (r.details.open) scrollToBottom();
 }
 /** Collapse the current reasoning block and label it with the think duration. */
@@ -658,6 +758,8 @@ function finalizeReasoning(secs?: number) {
   if (summary) summary.textContent = secs ? `Thought for ${secs}s` : "Thoughts";
   currentReasoning.details.open = false;
   currentReasoning = null;
+  // Label text can wrap / change height slightly; keep following if stuck.
+  scrollToBottom();
 }
 function shortTarget(s: string): string {
   return s.length > 48 ? s.slice(0, 47) + "…" : s;
@@ -1004,6 +1106,60 @@ function showApproval(p: ApprovalPayload) {
 function respond(id: string, decision: "approved" | "rejected" | "approved-always") {
   post({ type: "approvalResponse", id, decision });
   approvalEl.innerHTML = "";
+}
+
+/** Clarifying question from the ask_user tool. */
+function showAskUser(p: { id: string; question: string; options?: string[] }) {
+  approvalEl.innerHTML = "";
+  const card = el("div", "approval-card enter");
+  const head = el("div", "approval-head");
+  head.appendChild(el("span", "approval-title", "Question for you"));
+  head.appendChild(el("span", "approval-kind", "ask_user"));
+  card.appendChild(head);
+  card.appendChild(el("div", "approval-subject", p.question));
+
+  if (p.options && p.options.length) {
+    const opts = el("div", "approval-actions");
+    for (const o of p.options) {
+      const b = el("button", "btn btn-approve", o);
+      b.onclick = () => {
+        post({ type: "askUserResponse", id: p.id, answer: o });
+        approvalEl.innerHTML = "";
+      };
+      opts.appendChild(b);
+    }
+    card.appendChild(opts);
+  }
+
+  const row = el("div", "approval-actions");
+  const input = el("input", "set-input") as HTMLInputElement;
+  input.type = "text";
+  input.placeholder = p.options?.length ? "Or type a free-form answer…" : "Your answer…";
+  input.style.flex = "1";
+  const send = el("button", "btn btn-approve", "Send");
+  const skip = el("button", "btn btn-reject", "Skip");
+  const submit = () => {
+    post({ type: "askUserResponse", id: p.id, answer: input.value.trim() });
+    approvalEl.innerHTML = "";
+  };
+  send.onclick = submit;
+  input.onkeydown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submit();
+    }
+  };
+  skip.onclick = () => {
+    post({ type: "askUserResponse", id: p.id, answer: "" });
+    approvalEl.innerHTML = "";
+  };
+  row.appendChild(input);
+  row.appendChild(skip);
+  row.appendChild(send);
+  card.appendChild(row);
+  approvalEl.appendChild(card);
+  scrollToBottom();
+  setTimeout(() => input.focus(), 0);
 }
 // ---------- Overlay: sessions ----------
 function hideOverlay() {
@@ -1451,15 +1607,36 @@ function showSettings(s: SettingsPayload) {
   models.appendChild(
     setRow(
       "Summarizer model",
-      "Cheap model that writes checkpoint summaries during compaction. Empty = use the main model.",
-      textSetting("summarizerModel", s.summarizerModel, "same as model")
+      "Cheap model that writes checkpoint summaries during compaction. Empty = use the currently selected model.",
+      textSetting("summarizerModel", s.summarizerModel, "same as selected model")
+    )
+  );
+  const subagentInput = textSetting("subagentModel", s.subagentModel, "same as selected model");
+  const subagentWrap = el("div", "set-inline");
+  subagentWrap.appendChild(subagentInput);
+  const subagentBrowse = el("button", "btn set-browse", "Browse…");
+  // Reuse the model picker; after pick, write into subagentModel instead of model.
+  subagentBrowse.onclick = () => post({ type: "selectSubagentModel" });
+  subagentWrap.appendChild(subagentBrowse);
+  models.appendChild(
+    setRow(
+      "Subagent model",
+      "Model for research sub-agents (explore tool). Fast + cheap works well for digests. Empty = use the currently selected model.",
+      subagentWrap
     )
   );
   models.appendChild(
     setRow(
-      "Explore model",
-      "Model for the research sub-agent (explore tool). Fast + cheap works well. Empty = use the main model.",
-      textSetting("subagentModel", s.subagentModel, "same as model")
+      "Planner model",
+      "Cheap model for research/planning iterations of the main loop. Empty = always use the session model (often same as subagent).",
+      textSetting("plannerModel", s.plannerModel, "same as selected model")
+    )
+  );
+  models.appendChild(
+    setRow(
+      "Implementer model",
+      "Model for the implement tool's write-capable sub-agent. Empty = session model.",
+      textSetting("implementerModel", s.implementerModel, "same as selected model")
     )
   );
   models.appendChild(
@@ -1509,6 +1686,25 @@ function showSettings(s: SettingsPayload) {
   );
   ctx.appendChild(
     setRow(
+      "Microcompact threshold",
+      "Soft cleanup: stub superseded/stale tool results when context exceeds this fraction of the budget. 0 = off.",
+      sliderSetting("microcompactRatio", s.microcompactRatio, 0, 0.95, 0.05, (n) =>
+        n === 0 ? "off" : Math.round(n * 100) + "%"
+      )
+    )
+  );
+  ctx.appendChild(
+    setRow(
+      "Sub-agent context budget",
+      "Token budget for explore/implement sub-agent contexts. When exceeded, the sub-agent answers from what it has.",
+      numberSetting("subagentMaxContextTokens", s.subagentMaxContextTokens, {
+        min: 8000,
+        step: 1000,
+      })
+    )
+  );
+  ctx.appendChild(
+    setRow(
       "Prompt caching",
       "Cache-control breakpoints on stable prefixes (large cost saver — leave on).",
       toggleSetting("enablePromptCaching", s.enablePromptCaching)
@@ -1528,6 +1724,20 @@ function showSettings(s: SettingsPayload) {
       numberSetting("sessionBudgetUsd", s.sessionBudgetUsd, { min: 0, step: 0.5 })
     )
   );
+  ctx.appendChild(
+    setRow(
+      "Progressive tools",
+      "Start with read/meta schemas; unlock edit/exec after the first implement signal (lower prompt tax on research turns).",
+      toggleSetting("progressiveTools", s.progressiveTools)
+    )
+  );
+  ctx.appendChild(
+    setRow(
+      "Adaptive reasoning",
+      "Lower thinking effort on pure research follow-ups; raise when implementing.",
+      toggleSetting("adaptiveReasoning", s.adaptiveReasoning)
+    )
+  );
   body.appendChild(ctx);
 
   // --- Agent behavior ---
@@ -1542,7 +1752,7 @@ function showSettings(s: SettingsPayload) {
   beh.appendChild(
     setRow(
       "Loop guard",
-      "Stop the turn if the model rewrites the same file (or re-runs the same command) more than this many times — catches runaway second-guessing loops. 0 = disabled.",
+      "Soft-block rewriting the same file / re-running the same command (or identical call) more than this many times per turn. The model can adapt; hard-stop only after consecutive fully-blocked rounds. Does not affect paged reads. 0 = disabled.",
       numberSetting("loopGuardLimit", s.loopGuardLimit, { min: 0, step: 1 })
     )
   );
@@ -1876,6 +2086,9 @@ function showContextInfo(info: ContextInfo) {
     stats.appendChild(statCard("Next call (cached)", fmtCost(info.nextCallCostUsd), "green"));
   }
   stats.appendChild(statCard("Messages", String(info.messageCount)));
+  if (info.stubbedToolResults) {
+    stats.appendChild(statCard("Stubbed results", String(info.stubbedToolResults)));
+  }
   body.appendChild(stats);
   body.appendChild(
     el(
@@ -1884,6 +2097,16 @@ function showContextInfo(info: ContextInfo) {
       `System prompt ~${fmtTokens(info.systemTokens)} tokens${info.hasMemory ? " · includes LUNA.md project memory" : ""}`
     )
   );
+  if (info.byRole && info.byRole.length) {
+    body.appendChild(el("div", "block-label", "By role"));
+    for (const r of info.byRole) {
+      const row = el("div", "ctx-item");
+      row.appendChild(el("span", "ctx-role", r.role));
+      row.appendChild(el("span", "ctx-preview", `${r.count} message${r.count === 1 ? "" : "s"}`));
+      row.appendChild(el("span", "ctx-tokens", fmtTokens(r.tokens)));
+      body.appendChild(row);
+    }
+  }
   if (info.largest.length) {
     body.appendChild(el("div", "block-label", "Largest items in context"));
     for (const m of info.largest) {
@@ -1897,7 +2120,7 @@ function showContextInfo(info: ContextInfo) {
       el(
         "div",
         "set-hint",
-        "Every API call re-reads everything above (cached reads ≈ 10% of input price). Compaction trims it automatically at the budget."
+        "Every API call re-reads everything above (cached reads ≈ 10% of input price). Microcompact stubs stale tool results; hard compaction summarizes at the budget."
       )
     );
   }
@@ -2274,6 +2497,7 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       break;
     case "sessionReset":
       messagesEl.innerHTML = "";
+      stickToBottom = true;
       currentAssistant = null;
       currentReasoning = null;
       thinking = false;
@@ -2440,6 +2664,9 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
     }
     case "approvalRequest":
       showApproval(msg.payload);
+      break;
+    case "askUserRequest":
+      showAskUser(msg);
       break;
     case "sessionList":
       showSessionList(msg.sessions, msg.currentId);

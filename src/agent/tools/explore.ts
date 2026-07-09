@@ -1,15 +1,18 @@
 import { Tool, ToolResult } from "./types";
 
 /**
- * Delegates open-ended research to a sub-agent with its own disposable
- * context. The actual runner is injected by the Agent via ToolContext.explore
+ * Delegates open-ended research to one or more sub-agents, each with its own
+ * disposable context. The runner is injected by the Agent via ToolContext.explore
  * (the tool layer has no OpenRouter client of its own), and is absent inside
  * sub-agents so explore can never recurse.
+ *
+ * Pass `questions` (array) to fan out independent research topics in parallel —
+ * each question gets its own sub-agent and the digests are returned together.
  */
 export const exploreTool: Tool = {
   name: "explore",
   description:
-    "Delegate an open-ended research question about this codebase to a fast research sub-agent. It greps, reads, and traces code in a SEPARATE context and returns only a concise digest (files, line numbers, how the pieces connect) — keeping this conversation small and cheap. Use it for questions like 'how does auth work here?', 'where is X handled end-to-end?', or 'what would I need to touch to add Y?'. Do NOT use it to read one specific file you already know (use read_file), or for trivial single greps.",
+    "Delegate open-ended research to a sub-agent with its own context; returns a concise digest. Prefer for multi-hop questions. Pass questions (array) for parallel sub-agents.",
   mutating: false,
   parameters: {
     type: "object",
@@ -17,10 +20,15 @@ export const exploreTool: Tool = {
       question: {
         type: "string",
         description:
-          "The research question, with enough context to be answered independently (the sub-agent cannot see this conversation).",
+          "Single research question (sub-agent cannot see this conversation).",
+      },
+      questions: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Independent research questions in parallel (max 4).",
       },
     },
-    required: ["question"],
   },
   async execute(args, ctx): Promise<ToolResult> {
     if (!ctx.explore) {
@@ -29,10 +37,62 @@ export const exploreTool: Tool = {
         isError: true,
       };
     }
-    if (typeof args.question !== "string" || !args.question.trim()) {
-      return { content: "explore requires a non-empty question.", isError: true };
+
+    // Normalize to a list of questions. Prefer `questions` when both are set.
+    const list: string[] = [];
+    if (Array.isArray(args.questions)) {
+      for (const q of args.questions) {
+        if (typeof q === "string" && q.trim()) list.push(q.trim());
+      }
     }
-    const digest = await ctx.explore(args.question.trim());
-    return { content: digest };
+    if (!list.length && typeof args.question === "string" && args.question.trim()) {
+      list.push(args.question.trim());
+    }
+    if (!list.length) {
+      return {
+        content: "explore requires a non-empty `question` or `questions` array.",
+        isError: true,
+      };
+    }
+
+    // Cap fan-out so a runaway model can't spawn dozens of sub-agents.
+    const MAX_PARALLEL = 4;
+    const questions = list.slice(0, MAX_PARALLEL);
+    const truncated = list.length > MAX_PARALLEL;
+
+    if (questions.length === 1) {
+      const digest = await ctx.explore(questions[0]);
+      return { content: digest };
+    }
+
+    // Parallel orchestration: each question runs in its own sub-agent context.
+    ctx.emitOutput?.(
+      `Orchestrating ${questions.length} research sub-agents in parallel…\n`
+    );
+    const digests = await Promise.all(
+      questions.map(async (q, i) => {
+        ctx.emitOutput?.(`[${i + 1}/${questions.length}] ${q.slice(0, 80)}${q.length > 80 ? "…" : ""}\n`);
+        try {
+          const digest = await ctx.explore!(q);
+          return { q, digest, ok: true as const };
+        } catch (e: any) {
+          return {
+            q,
+            digest: `Explore failed: ${e?.message ?? e}`,
+            ok: false as const,
+          };
+        }
+      })
+    );
+
+    const parts = digests.map((d, i) => {
+      const header = `## Research ${i + 1}: ${d.q}`;
+      return `${header}\n\n${d.digest}`;
+    });
+    let content = parts.join("\n\n---\n\n");
+    if (truncated) {
+      content += `\n\n(Note: ${list.length - MAX_PARALLEL} additional question(s) were dropped — max ${MAX_PARALLEL} parallel explores.)`;
+    }
+    return { content };
   },
 };

@@ -4,7 +4,7 @@ import {
   LunaCodeViewProvider,
   openLunaCodeEditor,
 } from "./webview/provider";
-import { getConfig, setModel, SecretStore } from "./config";
+import { getConfig, setModel, setSubagentModel, SecretStore } from "./config";
 import { OpenRouterClient } from "./openrouter/client";
 import { SessionStore } from "./sessions";
 import { UsageStore } from "./usage";
@@ -91,6 +91,10 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand("lunacode.selectModel", async () => {
       await pickModel(secrets, controller);
+    }),
+
+    vscode.commands.registerCommand("lunacode.selectSubagentModel", async () => {
+      await pickSubagentModel(secrets, controller);
     }),
 
     vscode.commands.registerCommand("lunacode.addSelectionToChat", async () => {
@@ -207,6 +211,40 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 async function pickModel(secrets: SecretStore, controller: LunaCodeController) {
+  const modelId = await pickOpenRouterModel(secrets, {
+    title: "Select OpenRouter Model",
+    current: getConfig().model,
+  });
+  if (!modelId) return;
+  await setModel(modelId);
+  vscode.window.showInformationMessage(`Luna Code: model set to ${modelId}`);
+  await controller.sendConfig();
+}
+
+/** Pick a model for research sub-agents (explore). Empty string = use session model. */
+async function pickSubagentModel(secrets: SecretStore, controller: LunaCodeController) {
+  const cfg = getConfig();
+  const current = cfg.subagentModel || "(same as selected model)";
+  const modelId = await pickOpenRouterModel(secrets, {
+    title: "Select Subagent Model",
+    current,
+    allowClear: true,
+  });
+  if (modelId === undefined) return; // cancelled
+  await setSubagentModel(modelId);
+  vscode.window.showInformationMessage(
+    modelId
+      ? `Luna Code: subagent model set to ${modelId}`
+      : "Luna Code: subagent model cleared (uses selected model)"
+  );
+  // onDidChangeConfiguration will refresh the webview; nudge settings sheet too.
+  controller.onConfigChanged();
+}
+
+async function pickOpenRouterModel(
+  secrets: SecretStore,
+  opts: { title: string; current: string; allowClear?: boolean }
+): Promise<string | undefined> {
   const cfg = getConfig();
   const apiKey = await secrets.getApiKey();
 
@@ -222,27 +260,31 @@ async function pickModel(secrets: SecretStore, controller: LunaCodeController) {
         { label: "deepseek/deepseek-v4-flash", description: "DeepSeek · fastest & cheapest" },
         { label: "deepseek/deepseek-v4-pro", description: "DeepSeek · strong agentic coder, great value" },
       ];
+  if (opts.allowClear) {
+    curated.unshift({
+      label: "$(close) Use selected model",
+      description: "Clear override — sub-agents use the session model",
+    });
+  }
   curated.push({ label: "$(search) Browse all OpenRouter models…", description: "Fetch the full live list" });
 
   const choice = await vscode.window.showQuickPick(curated, {
-    title: "Select OpenRouter Model",
-    placeHolder: `Current: ${cfg.model}`,
+    title: opts.title,
+    placeHolder: `Current: ${opts.current}`,
   });
-  if (!choice) return;
+  if (!choice) return undefined;
 
+  if (choice.label.startsWith("$(close)")) return "";
   let modelId = choice.label;
   if (choice.label.startsWith("$(search)")) {
     if (!apiKey) {
       vscode.window.showWarningMessage("Set your API key first to browse models.");
-      return;
+      return undefined;
     }
     modelId = await browseAllModels(apiKey, cfg.baseUrl);
-    if (!modelId) return;
+    if (!modelId) return undefined;
   }
-
-  await setModel(modelId);
-  vscode.window.showInformationMessage(`Luna Code: model set to ${modelId}`);
-  await controller.sendConfig();
+  return modelId;
 }
 
 async function browseAllModels(apiKey: string, baseUrl: string): Promise<string> {

@@ -36,10 +36,15 @@ It's built for fast codebase navigation, efficient agentic sessions, and
   response **run in parallel**, and after every edit the file's language-server
   errors are **auto-appended to the tool result** so the model fixes breakage
   without an extra round-trip.
-- **Explore sub-agent.** An `explore` tool delegates open-ended research
-  ("how does auth work here?") to a disposable sub-agent with its own context
-  (`lunacode.subagentModel`, cheap model recommended). Only the digest returns
-  to the main conversation, keeping it small and cache-friendly.
+- **Explore sub-agents.** An `explore` tool delegates open-ended research
+  ("how does auth work here?") to disposable sub-agents with their own context
+  (`lunacode.subagentModel`, cheap model recommended — blank uses the selected
+  model). Pass `questions` to fan out independent topics in parallel. Only the
+  digests return to the main conversation, keeping it small and cache-friendly.
+- **Loop guard.** Soft-blocks runaway rewrite loops (same file/command mutated
+  too many times in one turn) so the model can adapt; hard-stops only after
+  consecutive fully-blocked rounds. Paged `read_file` ranges are never treated
+  as duplicates.
 - **Surgical reads.** A `file_outline` tool (language-server symbols with line
   ranges) plus `read_file` offset/limit paging — the agent pulls 40 relevant
   lines instead of whole files.
