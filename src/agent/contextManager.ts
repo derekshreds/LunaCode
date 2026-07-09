@@ -19,6 +19,23 @@ export interface CompactionResult {
   deduped: number;
 }
 
+export interface MicrocompactResult {
+  tokensSaved: number;
+  stubbed: number;
+}
+
+/** Per-role / tool-result breakdown for the context inspector. */
+export interface ContextBreakdown {
+  totalTokens: number;
+  systemTokens: number;
+  byRole: { role: string; tokens: number; count: number }[];
+  /** Largest individual messages (tool results include tool name when known). */
+  largest: { role: string; preview: string; tokens: number }[];
+  /** Count of tool results already stubbed as superseded/truncated. */
+  stubbedToolResults: number;
+  messageCount: number;
+}
+
 /** Read-only / re-runnable tools whose repeated identical results are safe to
  * supersede (latest occurrence wins). */
 const DEDUPE_TOOLS = new Set([
@@ -28,18 +45,40 @@ const DEDUPE_TOOLS = new Set([
   "grep",
   "run_command",
   "get_diagnostics",
+  "file_outline",
+  "find_symbol",
+  "find_references",
+  "read_process",
+  "explore",
+  "git_status",
+  "git_diff",
+  "git_log",
 ]);
+
+/** Tools whose results are keyed by a file path and can be path-superseded. */
+const PATH_SCOPED_TOOLS = new Set(["read_file", "file_outline"]);
+
+/** Edit tools that invalidate prior path-scoped reads of the same file. */
+const EDIT_TOOLS = new Set(["write_file", "edit_file", "apply_patch"]);
 
 /** Token headroom reserved for the checkpoint summary that replaces a span. */
 const SUMMARY_ALLOWANCE_TOKENS = 800;
 
-/** Stable stringify (sorted keys) so arg order never splits identity keys. */
+/** Soft microcompact: stub tool results larger than this (chars). */
+const MICRO_STUB_MIN_CHARS = 1500;
+/** Soft microcompact: leave this many chars when stubbing a large tool result. */
+const MICRO_STUB_KEEP_CHARS = 400;
+
+/** Stable stringify (sorted keys) so arg order never splits identity keys.
+ * Undefined-valued keys are dropped (JSON semantics): callers probing with
+ * `{path, offset: undefined}` must match a model call of just `{path}`. */
 function canonicalizeArgs(args: any): string {
   if (args === null || typeof args !== "object") return JSON.stringify(args);
   if (Array.isArray(args)) return "[" + args.map(canonicalizeArgs).join(",") + "]";
   return (
     "{" +
     Object.keys(args)
+      .filter((k) => args[k] !== undefined)
       .sort()
       .map((k) => JSON.stringify(k) + ":" + canonicalizeArgs(args[k]))
       .join(",") +
@@ -47,13 +86,34 @@ function canonicalizeArgs(args: any): string {
   );
 }
 
-/** Rough token estimate: ~4 chars per token. */
+/**
+ * Heuristic token estimate used until the session self-calibrates from real
+ * usage frames (see ContextManager.noteObservedUsage). ~3.5 chars/token for
+ * ASCII-heavy code, denser for CJK-heavy content.
+ */
 export function estimateTokens(messages: ChatMessage[]): number {
   let chars = 0;
+  let nonAscii = 0;
   for (const m of messages) {
-    chars += messageChars(m);
+    const c = messageChars(m);
+    chars += c;
+    // Sample the string content for non-ASCII density without a second full walk
+    // when content is already counted in messageChars — approximate via ratio on
+    // short previews only when cheap.
+    const preview =
+      typeof (m as any).content === "string"
+        ? ((m as any).content as string).slice(0, 400)
+        : "";
+    for (let i = 0; i < preview.length; i++) {
+      if (preview.charCodeAt(i) > 127) nonAscii++;
+    }
   }
-  return Math.ceil(chars / 4);
+  // More non-ASCII → closer to 2–3 chars/token; pure ASCII ~3.5
+  // (code is denser than prose due to punctuation/whitespace).
+  const sample = Math.max(1, Math.min(chars, 400 * messages.length));
+  const density = nonAscii / sample;
+  const charsPerToken = density > 0.3 ? 2.5 : density > 0.1 ? 3.0 : 3.5;
+  return Math.ceil(chars / charsPerToken);
 }
 
 function messageChars(m: ChatMessage): number {
@@ -73,6 +133,25 @@ function messageChars(m: ChatMessage): number {
   return chars;
 }
 
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((p: any) => (p?.type === "text" ? p.text : "[image]"))
+      .join(" ");
+  }
+  return "";
+}
+
+function isStubbedContent(content: string): boolean {
+  return (
+    content.startsWith("[superseded:") ||
+    content.startsWith("[stale:") ||
+    content.includes("[older tool output truncated") ||
+    content.startsWith("[microcompact:")
+  );
+}
+
 /**
  * Holds the conversation and renders the request message array with prompt-cache
  * breakpoints on stable prefixes.
@@ -84,10 +163,20 @@ function messageChars(m: ChatMessage): number {
  *    entire accumulated conversation becomes a cached prefix for the next turn.
  * Because the static system prompt never changes and new content is only ever
  * appended, every request after the first reuses the cached prefix.
+ *
+ * Lossy history mutations (dedupe, path supersession, microcompact, summarize)
+ * are EVENT-driven so the cache stays valid between events.
  */
 export class ContextManager {
   private systemPrompt = "";
   private messages: ChatMessage[] = [];
+  /** Supplier for a volatile block appended to the RENDERED request after all
+   * stored messages (e.g. the sticky scratchpad). It is never stored in
+   * `messages` and never holds a cache breakpoint, so it sits past the rolling
+   * breakpoint and can change every call without invalidating the cached
+   * prefix — unlike volatile text in the system prompt, which busts the whole
+   * prefix on every change. */
+  private ephemeralTail: (() => string) | null = null;
   // Stable per-message ids, index-aligned with `messages`. `messages` is spliced
   // by compaction and rollback, so positional indices are not stable across
   // turns — ids are. `turnStartIds` marks the ids that begin a turn (vs. mid-turn
@@ -134,8 +223,27 @@ export class ContextManager {
     this.systemPrompt = text;
   }
 
+  getSystemPrompt(): string {
+    return this.systemPrompt;
+  }
+
   setCaching(enabled: boolean) {
     this.cachingEnabled = enabled;
+  }
+
+  setEphemeralTail(fn: (() => string) | null) {
+    this.ephemeralTail = fn;
+  }
+
+  /** The ephemeral tail as a message, or null when empty. Shared by render()
+   * and estimate() so budget math counts what is actually sent. */
+  private renderTail(): ChatMessage | null {
+    const tail = this.ephemeralTail?.() ?? "";
+    if (!tail) return null;
+    return {
+      role: "user",
+      content: `[Session scratchpad — auto-maintained state, not a user message]\n${tail}`,
+    };
   }
 
   reset() {
@@ -185,10 +293,69 @@ export class ContextManager {
     this.ids.push(this.idSeq++);
   }
 
-  /** Total estimated tokens including the system prompt. */
+  /** Observed chars-per-token (EMA over real usage frames); 0 = uncalibrated. */
+  private observedCharsPerToken = 0;
+
+  /**
+   * Self-calibrate the token estimator from a real usage frame: the exact
+   * request chars are known (renderChars + tool schema) and the provider
+   * returns exact prompt_tokens on every call. No tokenizer dependency; the
+   * clamp keeps a rogue frame (e.g. a fallback model with a different
+   * tokenizer) from distorting the budget, and the EMA recovers regardless.
+   */
+  noteObservedUsage(sentChars: number, promptTokens: number) {
+    if (!promptTokens || promptTokens < 4000 || sentChars <= 0) return;
+    const ratio = Math.min(5.5, Math.max(2.0, sentChars / promptTokens));
+    this.observedCharsPerToken = this.observedCharsPerToken
+      ? 0.7 * this.observedCharsPerToken + 0.3 * ratio
+      : ratio;
+  }
+
+  /** Chars → tokens with the calibrated ratio (3.5 until first observation).
+   * The single divisor for ALL budget math — estimate, breakdown, and
+   * compaction-span sizing must agree or spans get mis-sized. */
+  private toTokens(chars: number): number {
+    return Math.ceil(chars / (this.observedCharsPerToken || 3.5));
+  }
+
+  /** Chars that render() would send (system + messages + ephemeral tail),
+   * excluding tool schemas — the caller adds those. */
+  renderChars(): number {
+    let chars = this.systemPrompt.length;
+    for (const m of this.messages) chars += messageChars(m);
+    const tail = this.renderTail();
+    if (tail) chars += messageChars(tail);
+    return chars;
+  }
+
+  /** Total estimated tokens including the system prompt and ephemeral tail. */
   estimate(): number {
+    if (this.observedCharsPerToken) return this.toTokens(this.renderChars());
+    // Uncalibrated: fall back to the non-ASCII-density heuristic.
     const sys: SystemMessage = { role: "system", content: this.systemPrompt };
-    return estimateTokens([sys, ...this.messages]);
+    const tail = this.renderTail();
+    return estimateTokens(tail ? [sys, ...this.messages, tail] : [sys, ...this.messages]);
+  }
+
+  /**
+   * Soft cleanup when context is getting large but still under the hard budget.
+   * Content-only stubs (dedupe + path supersession + truncate large older tool
+   * results). Intentionally causes one cache miss so subsequent turns re-cache
+   * a smaller prefix. Returns null when under the soft threshold.
+   */
+  microcompactIfNeeded(maxTokens: number, softRatio: number): MicrocompactResult | null {
+    if (!(softRatio > 0 && softRatio < 1)) return null;
+    const soft = Math.floor(maxTokens * softRatio);
+    const before = this.estimate();
+    if (before <= soft) return null;
+
+    let stubbed = this.dedupeStaleToolResults();
+    stubbed += this.supersedeStalePathReads();
+    stubbed += this.truncateLargeOlderToolResults(MICRO_STUB_MIN_CHARS, MICRO_STUB_KEEP_CHARS);
+
+    const saved = Math.max(0, before - this.estimate());
+    if (saved === 0 && stubbed === 0) return null;
+    return { tokensSaved: saved, stubbed };
   }
 
   /**
@@ -210,8 +377,9 @@ export class ContextManager {
     const before = this.estimate();
     const target = Math.floor(maxTokens * opts.targetRatio);
 
-    // Pass A: supersede stale duplicate tool results (latest occurrence wins).
-    const deduped = this.dedupeStaleToolResults();
+    // Pass A: supersede stale duplicate tool results + path-scoped reads.
+    let deduped = this.dedupeStaleToolResults();
+    deduped += this.supersedeStalePathReads();
 
     // Pass B: summarize-and-replace the oldest span down to the target floor.
     // Run it even if Pass A already got under maxTokens — stopping just under
@@ -255,6 +423,82 @@ export class ContextManager {
   }
 
   /**
+   * Immediately stub prior path-scoped reads of the given files (content-only).
+   * Used after successful edits so the model doesn't keep re-paying for stale
+   * pre-edit contents. Only stubs results larger than `minChars`.
+   */
+  invalidateFileReads(paths: string[], minChars = 2000): number {
+    if (!paths.length) return 0;
+    const pathSet = new Set(paths.map(normalizePathKey));
+    const callMeta = this.indexToolCalls();
+    let stubbed = 0;
+    for (const m of this.messages) {
+      if (m.role !== "tool" || typeof m.content !== "string") continue;
+      if (m.content.length < minChars) continue;
+      if (isStubbedContent(m.content)) continue;
+      const meta = callMeta.get(m.tool_call_id);
+      if (!meta || !PATH_SCOPED_TOOLS.has(meta.name)) continue;
+      if (!meta.path || !pathSet.has(normalizePathKey(meta.path))) continue;
+      m.content = `[stale: ${meta.name} ${meta.path} — file was edited later; re-read if you need current contents]`;
+      stubbed++;
+    }
+    return stubbed;
+  }
+
+  /** Breakdown of what's in the context window (for the inspector UI). */
+  breakdown(): ContextBreakdown {
+    const systemTokens = this.toTokens(this.systemPrompt.length);
+    const byRoleMap = new Map<string, { tokens: number; count: number }>();
+    byRoleMap.set("system", { tokens: systemTokens, count: 1 });
+
+    const callMeta = this.indexToolCalls();
+    let stubbedToolResults = 0;
+    const sized: { role: string; preview: string; tokens: number }[] = [];
+    let messageTokens = 0;
+
+    for (const m of this.messages) {
+      const tokens = this.toTokens(messageChars(m));
+      messageTokens += tokens;
+      const cur = byRoleMap.get(m.role) ?? { tokens: 0, count: 0 };
+      cur.tokens += tokens;
+      cur.count += 1;
+      byRoleMap.set(m.role, cur);
+
+      if (m.role === "tool") {
+        const meta = callMeta.get(m.tool_call_id);
+        const label = meta
+          ? `tool:${meta.name}${meta.path ? " " + meta.path : ""}`
+          : "tool";
+        const content = typeof m.content === "string" ? m.content : "";
+        if (isStubbedContent(content)) stubbedToolResults++;
+        sized.push({
+          role: label,
+          preview: content.replace(/\s+/g, " ").slice(0, 70),
+          tokens,
+        });
+      } else {
+        const preview = textOf(m.content).replace(/\s+/g, " ").slice(0, 70);
+        let roleLabel: string = m.role;
+        if (m.role === "assistant" && "tool_calls" in m && m.tool_calls?.length && !preview) {
+          roleLabel = `assistant→${m.tool_calls.map((tc) => tc.function.name).join(",")}`;
+        }
+        sized.push({ role: roleLabel, preview, tokens });
+      }
+    }
+
+    return {
+      totalTokens: systemTokens + messageTokens,
+      systemTokens,
+      byRole: [...byRoleMap.entries()]
+        .map(([role, v]) => ({ role, tokens: v.tokens, count: v.count }))
+        .sort((a, b) => b.tokens - a.tokens),
+      largest: sized.sort((a, b) => b.tokens - a.tokens).slice(0, 8),
+      stubbedToolResults,
+      messageCount: this.messages.length,
+    };
+  }
+
+  /**
    * Replace all-but-the-latest results of repeated identical read-only tool
    * calls with a one-line stub. Identity is derived from the paired assistant
    * `tool_calls` (name + canonicalized args), so it works for live and
@@ -272,7 +516,7 @@ export class ContextManager {
           const args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
           const key = tc.function.name + "|" + canonicalizeArgs(args);
           callInfo.set(tc.id, key);
-          const primary = args.path ?? args.pattern ?? args.command ?? "";
+          const primary = args.path ?? args.pattern ?? args.command ?? args.question ?? args.id ?? "";
           callLabel.set(tc.id, `${tc.function.name} ${primary}`.trim());
         } catch {
           // Unparsable args: never stub blindly.
@@ -298,13 +542,178 @@ export class ContextManager {
       for (const i of indexes.slice(0, -1)) {
         const m = this.messages[i];
         if (m.role !== "tool" || typeof m.content !== "string") continue;
-        if (m.content.startsWith("[superseded:")) continue;
+        if (isStubbedContent(m.content)) continue;
         const label = callLabel.get(m.tool_call_id) ?? "this call";
         m.content = `[superseded: ${label} was re-run later in this conversation — see the newer result]`;
         stubbed++;
       }
     }
     return stubbed;
+  }
+
+  /**
+   * Path-scoped supersession for read_file / file_outline.
+   *
+   * IMPORTANT: different offset/limit pages of the same file are NOT duplicates —
+   * the agent pages large files on purpose. We only collapse:
+   *  1. Re-reads of the *same* path + range (offset/limit), keeping the latest.
+   *  2. Any path-scoped read that precedes an edit of that path (pre-edit contents
+   *     are stale regardless of range).
+   */
+  private supersedeStalePathReads(): number {
+    const callMeta = this.indexToolCalls();
+    // Same path + same range → true re-read of that page.
+    const byPathRange = new Map<string, number[]>();
+    // All ranges of a path (for edit invalidation).
+    const byPath = new Map<string, number[]>();
+    // Track the message index of the first edit of each path.
+    const firstEditIdx = new Map<string, number>();
+
+    for (let i = 0; i < this.messages.length; i++) {
+      const m = this.messages[i];
+      if (m.role === "assistant" && "tool_calls" in m && m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          if (!EDIT_TOOLS.has(tc.function.name)) continue;
+          for (const p of editPathsFromCall(tc.function.name, tc.function.arguments)) {
+            const key = normalizePathKey(p);
+            if (!firstEditIdx.has(key)) firstEditIdx.set(key, i);
+          }
+        }
+      }
+      if (m.role !== "tool") continue;
+      const meta = callMeta.get(m.tool_call_id);
+      if (!meta || !PATH_SCOPED_TOOLS.has(meta.name) || !meta.path) continue;
+      const pathKey = normalizePathKey(meta.path);
+      const rangeKey = `${pathKey}|${meta.rangeKey ?? ""}`;
+      const rangeList = byPathRange.get(rangeKey);
+      if (rangeList) rangeList.push(i);
+      else byPathRange.set(rangeKey, [i]);
+      const pathList = byPath.get(pathKey);
+      if (pathList) pathList.push(i);
+      else byPath.set(pathKey, [i]);
+    }
+
+    let stubbed = 0;
+    // (1) Same path+range re-read: keep latest, stub earlier.
+    for (const [rangeKey, indexes] of byPathRange) {
+      for (const i of indexes.slice(0, -1)) {
+        const m = this.messages[i];
+        if (m.role !== "tool" || typeof m.content !== "string") continue;
+        if (isStubbedContent(m.content)) continue;
+        const meta = callMeta.get(m.tool_call_id);
+        const pathPart = meta?.path ?? rangeKey.split("|")[0];
+        const rangeHint = meta?.rangeKey && meta.rangeKey !== ":" ? ` [${meta.rangeKey}]` : "";
+        m.content = `[superseded: ${meta?.name ?? "read"} ${pathPart}${rangeHint} — a newer read of this range is later in the conversation]`;
+        stubbed++;
+      }
+    }
+    // (2) Edit invalidation: any pre-edit read of the path is stale (all ranges).
+    for (const [pathKey, indexes] of byPath) {
+      const editAt = firstEditIdx.get(pathKey);
+      if (editAt === undefined) continue;
+      for (const i of indexes) {
+        if (i >= editAt) continue;
+        const m = this.messages[i];
+        if (m.role !== "tool" || typeof m.content !== "string") continue;
+        if (isStubbedContent(m.content)) continue;
+        const meta = callMeta.get(m.tool_call_id);
+        m.content = `[stale: ${meta?.name ?? "read"} ${meta?.path ?? pathKey} — file was edited later; re-read if you need current contents]`;
+        stubbed++;
+      }
+    }
+    return stubbed;
+  }
+
+  /**
+   * Truncate large tool results that sit before the last user message (older
+   * than the active task). Content-only; keeps a short head for orientation.
+   */
+  private truncateLargeOlderToolResults(minChars: number, keepChars: number): number {
+    const lastUser = this.lastUserIndex();
+    if (lastUser <= 0) return 0;
+    let stubbed = 0;
+    for (let i = 0; i < lastUser; i++) {
+      const m = this.messages[i];
+      if (m.role !== "tool" || typeof m.content !== "string") continue;
+      if (m.content.length <= minChars) continue;
+      if (isStubbedContent(m.content)) continue;
+      m.content =
+        m.content.slice(0, keepChars) +
+        `\n…[microcompact: older tool output truncated (${m.content.length} → ${keepChars} chars)]`;
+      stubbed++;
+    }
+    return stubbed;
+  }
+
+  /** Map tool_call_id → { name, path?, rangeKey? } from assistant tool_calls.
+   * rangeKey is "offset:limit" for paged reads so different pages don't collide. */
+  private indexToolCalls(): Map<string, { name: string; path?: string; rangeKey?: string }> {
+    const map = new Map<string, { name: string; path?: string; rangeKey?: string }>();
+    for (const m of this.messages) {
+      if (m.role !== "assistant" || !("tool_calls" in m) || !m.tool_calls) continue;
+      for (const tc of m.tool_calls) {
+        let path: string | undefined;
+        let rangeKey: string | undefined;
+        try {
+          const args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+          if (typeof args.path === "string") path = args.path;
+          if (PATH_SCOPED_TOOLS.has(tc.function.name)) {
+            // Normalize missing offset/limit to empty so full-file reads group together.
+            const off = args.offset != null && Number.isFinite(Number(args.offset)) ? Number(args.offset) : "";
+            const lim = args.limit != null && Number.isFinite(Number(args.limit)) ? Number(args.limit) : "";
+            rangeKey = `${off}:${lim}`;
+          }
+        } catch {
+          /* ignore */
+        }
+        map.set(tc.id, { name: tc.function.name, path, rangeKey });
+      }
+    }
+    return map;
+  }
+
+  /**
+   * Find a non-stubbed tool result already in the conversation for the same
+   * tool name + canonical args. Used by read tools to short-circuit duplicate
+   * lookups (saves tokens on the next model call).
+   */
+  findLiveToolResult(
+    toolName: string,
+    args: Record<string, unknown>
+  ): { label: string; content: string } | null {
+    const key = toolName + "|" + canonicalizeArgs(args ?? {});
+    // Walk newest → oldest so we return the latest live result.
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i];
+      if (m.role !== "tool" || typeof m.content !== "string") continue;
+      if (isStubbedContent(m.content)) continue;
+      // Find the assistant tool_call that produced this result.
+      let matched = false;
+      let label = toolName;
+      for (let j = i - 1; j >= 0; j--) {
+        const a = this.messages[j];
+        if (a.role !== "assistant" || !("tool_calls" in a) || !a.tool_calls) continue;
+        const tc = a.tool_calls.find((t) => t.id === m.tool_call_id);
+        if (!tc) continue;
+        if (tc.function.name !== toolName) break;
+        try {
+          const tcArgs = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
+          if (toolName + "|" + canonicalizeArgs(tcArgs) === key) {
+            matched = true;
+            const primary =
+              tcArgs.path ?? tcArgs.pattern ?? tcArgs.command ?? tcArgs.query ?? tcArgs.question ?? "";
+            label = primary ? `${toolName} ${primary}` : toolName;
+          }
+        } catch {
+          /* ignore */
+        }
+        break;
+      }
+      if (matched) {
+        return { label, content: m.content };
+      }
+    }
+    return null;
   }
 
   /**
@@ -324,7 +733,9 @@ export class ContextManager {
     let spanTokens = 0;
     let end = start;
     while (end < lastUserIdx && spanTokens - SUMMARY_ALLOWANCE_TOKENS < overage) {
-      spanTokens += Math.ceil(messageChars(this.messages[end]) / 4);
+      // Same divisor as estimate() — a mismatch here mis-sizes the span and
+      // systematically over- or under-summarizes.
+      spanTokens += this.toTokens(messageChars(this.messages[end]));
       end++;
     }
     // Never strand a tool result at the new boundary.
@@ -338,23 +749,30 @@ export class ContextManager {
 
   /** Fallback when no summary is available: truncate then drop to target. */
   private legacyCompact(start: number, target: number) {
+    // Running total instead of re-walking every message per iteration —
+    // estimate() per removed message made this O(n²) in message chars.
+    let total = this.estimate();
     // Truncate big tool outputs first (cheapest loss).
     for (const m of this.messages) {
-      if (this.estimate() <= target) break;
+      if (total <= target) break;
       if (m === this.messages[this.lastUserIndex()]) break;
       if (m.role === "tool" && typeof m.content === "string" && m.content.length > 1500) {
+        const beforeChars = m.content.length;
         m.content =
           m.content.slice(0, 1200) + `\n…[older tool output truncated to save context]`;
+        total -= this.toTokens(beforeChars - m.content.length);
       }
     }
     // Then drop the oldest messages, sweeping orphaned tool results so a tool
     // message never leads the boundary, and never touching the active task.
     let removedCount = 0;
-    while (this.estimate() > target && start < this.lastUserIndex()) {
+    while (total > target && start < this.lastUserIndex()) {
+      total -= this.toTokens(messageChars(this.messages[start]));
       this.messages.splice(start, 1);
       this.spliceIds(start, 1, 0);
       removedCount++;
       while (start < this.lastUserIndex() && this.messages[start]?.role === "tool") {
+        total -= this.toTokens(messageChars(this.messages[start]));
         this.messages.splice(start, 1);
         this.spliceIds(start, 1, 0);
         removedCount++;
@@ -384,6 +802,9 @@ export class ContextManager {
     for (let i = 0; i < this.messages.length; i++) {
       out.push(bps.has(i) ? withCacheControl(this.messages[i]) : this.messages[i]);
     }
+    // Volatile tail goes last, past every breakpoint — cache-free by position.
+    const tail = this.renderTail();
+    if (tail) out.push(tail);
     return out;
   }
 
@@ -509,4 +930,22 @@ function withCacheControl(msg: ChatMessage): ChatMessage {
     }
   }
   return msg;
+}
+
+function normalizePathKey(p: string): string {
+  return p.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+}
+
+function editPathsFromCall(name: string, argsJson: string): string[] {
+  try {
+    const args = argsJson ? JSON.parse(argsJson) : {};
+    if (name === "apply_patch") {
+      return Array.isArray(args?.changes)
+        ? args.changes.map((c: any) => c?.path).filter((p: any) => typeof p === "string")
+        : [];
+    }
+    return typeof args?.path === "string" ? [args.path] : [];
+  } catch {
+    return [];
+  }
 }

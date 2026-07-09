@@ -1,10 +1,10 @@
 import { spawn } from "child_process";
 import * as os from "os";
 import { Tool, ToolContext, ToolResult } from "./types";
-import { resolveInWorkspace, truncate } from "./util";
+import { resolveInWorkspace, truncateHeadTail } from "./util";
 import { getConfig } from "../../config";
 
-const MAX_OUTPUT_CHARS = 30000;
+const MAX_OUTPUT_CHARS = 18_000;
 const DEFAULT_TIMEOUT_MS = 120000;
 
 /** Heuristic: is this command read-only / safe to auto-run? */
@@ -37,19 +37,20 @@ export function isBlocked(cmd: string): string | null {
 export const runCommandTool: Tool = {
   name: "run_command",
   description:
-    "Run a shell command in the workspace and capture its stdout/stderr. Use for builds, tests, git, package managers, and scripts. On Windows the command runs in PowerShell; elsewhere in bash/sh. Long-running or interactive commands are not supported.",
+    "Run a shell command and capture stdout/stderr. For builds, tests, git, package managers. Not for long-running processes (use start_process).",
   mutating: true,
+  group: "exec",
   parameters: {
     type: "object",
     properties: {
-      command: { type: "string", description: "The full command line to execute." },
+      command: { type: "string", description: "Command line to execute." },
       cwd: {
         type: "string",
-        description: "Working directory relative to the workspace root (optional).",
+        description: "Working dir relative to workspace (optional).",
       },
       timeout_ms: {
         type: "number",
-        description: `Timeout in milliseconds (default ${DEFAULT_TIMEOUT_MS}).`,
+        description: `Timeout ms (default ${DEFAULT_TIMEOUT_MS}).`,
       },
     },
     required: ["command"],
@@ -61,6 +62,26 @@ export const runCommandTool: Tool = {
       return {
         content: `Command blocked: it matches the always-deny rule "${blocked}".`,
         isError: true,
+      };
+    }
+
+    // Smart verify: skip re-running an identical successful test/build if no
+    // relevant files have been edited since (saves a full suite + model turn).
+    const vc = ctx.verifyCache;
+    if (
+      vc &&
+      vc.exitCode === 0 &&
+      vc.command.trim() === String(command).trim() &&
+      Date.now() - vc.at < 10 * 60 * 1000 &&
+      /\b(test|check|lint|typecheck|tsc|pytest|jest|vitest|cargo test|go test|npm test|pnpm test|yarn test)\b/i.test(
+        command
+      )
+    ) {
+      return {
+        content:
+          `Skipped — still green from earlier this turn/session (` +
+          `${Math.round((Date.now() - vc.at) / 1000)}s ago, exit 0). ` +
+          `Re-run only if you edited code since then or need a fresh signal.`,
       };
     }
 
@@ -112,7 +133,7 @@ export const runCommandTool: Tool = {
         if (settled) return;
         settled = true;
         child.kill();
-        const out = combine(stdout, stderr);
+        const { text: out } = truncateHeadTail(combine(stdout, stderr), MAX_OUTPUT_CHARS);
         resolve({
           content: `Command timed out after ${timeout}ms.\n${out}`,
           isError: true,
@@ -153,7 +174,8 @@ export const runCommandTool: Tool = {
         clearTimeout(timer);
         ctx.signal.removeEventListener("abort", onAbort);
         const combined = combine(stdout, stderr);
-        const { text } = truncate(combined, MAX_OUTPUT_CHARS);
+        // Keep head + tail so build errors at the end survive truncation.
+        const { text } = truncateHeadTail(combined, MAX_OUTPUT_CHARS);
         const status = code === 0 ? "exit 0" : `exit ${code}`;
         resolve({
           content: `[${status}]\n${text || "(no output)"}`,

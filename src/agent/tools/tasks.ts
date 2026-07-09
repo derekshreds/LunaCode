@@ -8,7 +8,7 @@ import { Tool, ToolResult } from "./types";
 export const setTasksTool: Tool = {
   name: "set_tasks",
   description:
-    "Create or update your visible task checklist for multi-step work. Replaces the entire list each call. Use it at the start of any task with 3+ steps, mark exactly one task 'active' while working on it, and update statuses as you complete each step. Keeps the user informed during long autonomous runs.",
+    "Create/update the visible task checklist. Replaces the whole list each call. Keep exactly one task 'active'.",
   mutating: false,
   parameters: {
     type: "object",
@@ -18,7 +18,7 @@ export const setTasksTool: Tool = {
         items: {
           type: "object",
           properties: {
-            label: { type: "string", description: "Short imperative step, e.g. 'Add config key'." },
+            label: { type: "string", description: "Short imperative step." },
             status: { type: "string", enum: ["pending", "active", "done"] },
           },
           required: ["label", "status"],

@@ -24,6 +24,15 @@ export interface StoredSession extends SessionMeta {
    * Read for back-compat with sessions saved before the rewind feature; no
    * longer written. */
   checkpoints?: Array<Array<[string, string | null]>>;
+  /** Session scratchpad that survives extension reloads. */
+  stickyMemory?: {
+    goal?: string;
+    decisions: string[];
+    filesTouched: string[];
+    openErrors: string[];
+    nextStep?: string;
+    commands: Record<string, string>;
+  };
 }
 
 const INDEX_KEY = "lunacode.sessions.index";

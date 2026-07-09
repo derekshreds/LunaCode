@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import { AgentMode } from "../../modes";
 import { DiffData } from "../../webview/protocol";
+import type { StickyMemory } from "../stickyMemory";
+import type { ContextManager } from "../contextManager";
 
 /** Outcome of an approval request. */
 export type ApprovalDecision = "approved" | "rejected" | "approved-always";
@@ -39,10 +41,37 @@ export interface ToolContext {
    */
   explore?(question: string): Promise<string>;
   /**
+   * Run a bounded implementation task in a disposable write-capable sub-agent.
+   * Absent in Plan mode and inside sub-agents.
+   */
+  implement?(task: string): Promise<string>;
+  /**
+   * Ask the user a clarifying question and wait for their answer.
+   * Injected by the main Agent; absent inside sub-agents.
+   */
+  askUser?(req: { question: string; options?: string[] }): Promise<string>;
+  /**
    * Stream live output (stdout, sub-agent progress) to this call's card in
    * the UI while the tool runs. Display-only — never part of the tool result.
    */
   emitOutput?(delta: string): void;
+  /** Session scratchpad that survives compaction (shared mutable object). */
+  stickyMemory?: StickyMemory;
+  /**
+   * Live conversation context — used by read tools to short-circuit duplicate
+   * lookups that are already present (non-stubbed) in the transcript.
+   */
+  context?: ContextManager;
+  /**
+   * Last successful test/build command fingerprint for smart verify skip.
+   * Shared mutable object owned by the Agent.
+   */
+  verifyCache?: {
+    command: string;
+    exitCode: number;
+    at: number;
+    pathsHint?: string[];
+  };
 }
 
 export interface ToolResult {
@@ -61,6 +90,14 @@ export interface Tool {
   parameters: Record<string, unknown>;
   /** True if the tool can modify the workspace or run commands. */
   mutating: boolean;
+  /**
+   * Tool group for progressive schema loading.
+   * - read: always available
+   * - edit: file mutations
+   * - exec: shell / processes
+   * - meta: orchestration (explore, implement, ask_user, tasks, memory)
+   */
+  group?: "read" | "edit" | "exec" | "meta";
   /**
    * In Plan mode, mutating tools are blocked. Read-only tools always run.
    * Returns the result string shown to the model.

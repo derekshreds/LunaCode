@@ -109,6 +109,10 @@
         "title": "Luna Code: Select Model"
       },
       {
+        "command": "lunacode.selectSubagentModel",
+        "title": "Luna Code: Select Subagent Model"
+      },
+      {
         "command": "lunacode.addSelectionToChat",
         "title": "Luna Code: Add Selection to Chat"
       },
@@ -325,10 +329,17 @@
         },
         "lunacode.compactionTargetRatio": {
           "type": "number",
-          "default": 0.45,
+          "default": 0.35,
           "minimum": 0.2,
           "maximum": 0.8,
           "description": "When a compaction event fires, the context is reduced to this fraction of the budget. Lower = rarer compactions (better prompt-cache economics) but more history summarized away."
+        },
+        "lunacode.microcompactRatio": {
+          "type": "number",
+          "default": 0.55,
+          "minimum": 0,
+          "maximum": 0.95,
+          "description": "Soft context cleanup: when estimated tokens exceed this fraction of the budget, Luna Code stubs superseded/stale tool results and truncates large older outputs (content-only — one prompt-cache miss). 0 disables. Hard compaction (summarize/drop) still fires at the full budget."
         },
         "lunacode.summarizerModel": {
           "type": "string",
@@ -338,7 +349,33 @@
         "lunacode.subagentModel": {
           "type": "string",
           "default": "",
-          "description": "OpenRouter model id for the explore research sub-agent (investigates the codebase in a separate context and returns a digest). A fast, cheap model works well here. Empty = use the active session model."
+          "description": "OpenRouter model id for research sub-agents (explore tool — including parallel multi-question explores). A fast, cheap model works well here. Empty = use the currently selected session model."
+        },
+        "lunacode.plannerModel": {
+          "type": "string",
+          "default": "",
+          "description": "Cheap model for research/planning iterations of the main agent loop. When set, read-only phases route here; implement phases stay on the primary model. Empty = always use the session model. Often the same as subagentModel. Note: provider prompt caches are per-model, so each swap between planner and primary re-reads the conversation uncached on the other model — on long sessions the cheaper rate may not beat the lost cache hits."
+        },
+        "lunacode.implementerModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model for the implement tool's write-capable sub-agent. Empty = use the session model (or subagentModel if you prefer a cheaper implementer)."
+        },
+        "lunacode.subagentMaxContextTokens": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 8000,
+          "description": "Token budget for explore/implement sub-agent contexts. When exceeded, the sub-agent is forced to answer from what it has. Lower = cheaper digests; higher = deeper research."
+        },
+        "lunacode.progressiveTools": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start each turn with read/meta tool schemas only; unlock edit/exec tools after the first implement signal. Reduces fixed prompt tax on research-heavy turns. Tool-set changes only at iteration boundaries (cache-safe)."
+        },
+        "lunacode.adaptiveReasoning": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically lower reasoning effort on pure research follow-up iterations (saves cost on reasoning-capable models). Raises back when implementing."
         },
         "lunacode.sessionBudgetUsd": {
           "type": "number",
@@ -355,7 +392,7 @@
           "type": "number",
           "default": 10,
           "minimum": 0,
-          "description": "Stop the current turn if the model rewrites the same file (or re-runs the same command) more than this many times — catches runaway 'second-guess and rewrite' loops that burn tokens without progress. 0 = disabled."
+          "description": "Soft-block a mutating tool call if the same file/command (or an identical call) is re-issued more than this many times in one turn — catches runaway second-guessing loops. The model gets a reason and can adapt; the turn only hard-stops after consecutive fully-blocked rounds. Does not apply to read_file paging. 0 = disabled."
         },
         "lunacode.includeActiveFile": {
           "type": "boolean",
@@ -481,7 +518,7 @@
     "check-types": "tsc --noEmit",
     "lint": "echo \"(no lint configured)\"",
     "pretest": "node scripts/build-tests.js",
-    "test": "node dist/test-context.js && node dist/test-usage.js && node dist/test-checkpoints.js"
+    "test": "node dist/test-context.js && node dist/test-usage.js && node dist/test-checkpoints.js && node dist/test-loop-guard.js"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

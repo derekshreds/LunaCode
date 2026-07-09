@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
+import { spawn } from "child_process";
+import * as path from "path";
+import * as fs from "fs";
 import { Tool, ToolContext, ToolResult } from "./types";
-import { resolveInWorkspace, toRelative } from "./util";
+import { dedupHit, resolveInWorkspace, toRelative, truncate, makeCacheKey, readCacheGet, readCacheSet } from "./util";
 
 function severityName(s: vscode.DiagnosticSeverity): string {
   switch (s) {
@@ -27,7 +30,7 @@ export async function postEditDiagnostics(
   relPath: string,
   signal: AbortSignal
 ): Promise<string | null> {
-  await new Promise((r) => setTimeout(r, 700));
+  await new Promise((r) => setTimeout(r, 400));
   if (signal.aborted) return null;
   let abs: string;
   try {
@@ -54,6 +57,121 @@ export async function postEditDiagnostics(
   return `Diagnostics after this edit (fix errors before moving on):\n${lines.join("\n")}${extra}`;
 }
 
+/**
+ * Post-edit lint gate: detect the project's linter, run it on the specific
+ * file, and return the output (truncated to 2000 chars). Returns null when no
+ * linter is detected or the linter produces no output.
+ *
+ * Detected linters (in priority order):
+ *  - eslint (config: .eslintrc.*, eslint.config.*)
+ *  - biome (config: biome.json)
+ *  - ruff (config: pyproject.toml [tool.ruff])
+ *  - pylint (config: .pylintrc)
+ *  - clippy (config: Cargo.toml)
+ */
+export async function postEditLint(
+  workspaceRoot: string,
+  relPath: string
+): Promise<string | null> {
+  const linter = detectLinter(workspaceRoot);
+  if (!linter) return null;
+
+  const abs = path.resolve(workspaceRoot, relPath);
+  if (!fs.existsSync(abs)) return null;
+
+  return await runLinter(linter, abs, workspaceRoot);
+}
+
+interface LinterConfig {
+  cmd: string;
+  args: string[];
+}
+
+function detectLinter(workspaceRoot: string): LinterConfig | null {
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(workspaceRoot);
+  } catch {
+    return null;
+  }
+  const has = (name: string) => entries.includes(name);
+  const hasMatch = (re: RegExp) => entries.some((e) => re.test(e));
+
+  // Priority: eslint, biome, ruff, pylint, clippy
+  if (hasMatch(/^\.eslintrc\./) || hasMatch(/^eslint\.config\./) || has(".eslintrc")) {
+    return { cmd: "npx", args: ["eslint", "--format", "compact", "--no-color"] };
+  }
+  if (has("biome.json") || has("biome.jsonc")) {
+    return { cmd: "npx", args: ["biome", "lint"] };
+  }
+  if (has("pyproject.toml") || has("ruff.toml")) {
+    // Prefer ruff when present; fall through if binary missing (runLinter handles that).
+    return { cmd: "ruff", args: ["check"] };
+  }
+  if (has(".pylintrc") || has("pylintrc")) {
+    return { cmd: "pylint", args: ["--output-format=text"] };
+  }
+  if (has("Cargo.toml")) {
+    // Clippy needs a package context; lint the whole package (file path ignored by cargo).
+    return { cmd: "cargo", args: ["clippy", "--message-format=short", "--", "-A", "warnings"] };
+  }
+  return null;
+}
+
+function runLinter(
+  linter: LinterConfig,
+  filePath: string,
+  cwd: string
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    const args =
+      linter.cmd === "cargo" ? [...linter.args] : [...linter.args, filePath];
+    const child = spawn(linter.cmd, args, {
+      cwd,
+      env: { ...process.env, PATH: process.env.PATH },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve(null); // timeout → treat as no output
+    }, 5000);
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout?.on("data", (d: Buffer) => {
+      stdout += d.toString();
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      stderr += d.toString();
+    });
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        // Clean exit — remaining output is version banners / summary noise,
+        // not actionable; don't spend transcript tokens on it.
+        resolve(null);
+        return;
+      }
+      const combined = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n[stderr]\n");
+      if (!combined) {
+        resolve(null);
+        return;
+      }
+      // Truncate to 2000 chars max
+      const { text } = truncate(combined, 2000);
+      resolve(`[Lint exit ${code}]\n${text}`);
+    });
+
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(null); // linter not installed / not found
+    });
+  });
+}
+
 /** Best-effort: format an edited file with the workspace's formatter so agent
  * edits match project style (and never trigger format-only lint noise). */
 export async function formatFile(workspaceRoot: string, relPath: string): Promise<void> {
@@ -76,7 +194,7 @@ export async function formatFile(workspaceRoot: string, relPath: string): Promis
   }
 }
 
-function symbolKindName(k: vscode.SymbolKind): string {
+export function symbolKindName(k: vscode.SymbolKind): string {
   // Compact, model-friendly names for the common kinds.
   const names: Partial<Record<vscode.SymbolKind, string>> = {
     [vscode.SymbolKind.File]: "file",
@@ -102,16 +220,23 @@ function symbolKindName(k: vscode.SymbolKind): string {
 export const outlineTool: Tool = {
   name: "file_outline",
   description:
-    "Get the symbol outline of a file (classes, functions, methods with their line ranges) from the language server. MUCH cheaper than reading a whole file — use this first on large files, then read_file with offset/limit to pull just the range you need.",
+    "Symbol outline of a file (classes, functions, methods with line ranges). Prefer over whole-file reads.",
   mutating: false,
+  group: "read",
   parameters: {
     type: "object",
     properties: {
-      path: { type: "string", description: "Workspace-relative path to the file." },
+      path: { type: "string", description: "Workspace-relative path." },
     },
     required: ["path"],
   },
   async execute(args, ctx: ToolContext): Promise<ToolResult> {
+    const dup = dedupHit(ctx, "file_outline", { path: args.path });
+    if (dup) return dup;
+    const cacheKey = makeCacheKey("file_outline", { path: args.path });
+    const cached = readCacheGet(cacheKey);
+    if (cached) return cached;
+
     const abs = resolveInWorkspace(ctx.workspaceRoot, args.path);
     const uri = vscode.Uri.file(abs);
     let doc: vscode.TextDocument;
@@ -145,25 +270,28 @@ export const outlineTool: Tool = {
     };
     walk(symbols, 0);
 
-    return {
+    const result: ToolResult = {
       content: `${args.path} (${doc.lineCount} lines) — outline [start-end lines]:\n` + lines.join("\n"),
     };
+    readCacheSet(cacheKey, result.content);
+    return result;
   },
 };
 
 export const diagnosticsTool: Tool = {
   name: "get_diagnostics",
   description:
-    "Get current language-server diagnostics (errors and warnings) for the workspace or a specific file. Use SPARINGLY: at most once after a batch of edits to a language with an active language server (TypeScript, Python, etc.). It returns nothing for plain HTML/CSS/JSON/Markdown or when no language server is running, so don't call it for those or after every edit.",
+    "Language-server diagnostics for workspace or one file. Prefer auto-appended post-edit diagnostics.",
   mutating: false,
+  group: "read",
   parameters: {
     type: "object",
     properties: {
       path: {
         type: "string",
-        description: "Workspace-relative file to scope to (optional; omit for all files).",
+        description: "File to scope to (optional; omit for all).",
       },
-      errorsOnly: { type: "boolean", description: "Only return errors (default false)." },
+      errorsOnly: { type: "boolean", description: "Only errors (default false)." },
     },
   },
   async execute(args, ctx: ToolContext): Promise<ToolResult> {
@@ -201,6 +329,123 @@ export const diagnosticsTool: Tool = {
         lines.length === 0
           ? "No diagnostics. ✓"
           : `${lines.length} diagnostic(s):\n` + lines.join("\n"),
+    };
+  },
+};
+
+/**
+ * Find all references to a symbol at a given file:line using the language
+ * server's reference provider. Returns results grouped by file with line text
+ * context.
+ */
+export const findReferencesTool: Tool = {
+  name: "find_references",
+  description:
+    "Find all references to a symbol across the workspace. Specify file path and line number.",
+  mutating: false,
+  group: "read",
+  parameters: {
+    type: "object",
+    properties: {
+      path: {
+        type: "string",
+        description: "File containing the symbol.",
+      },
+      line: {
+        type: "number",
+        description: "1-based line of the symbol.",
+      },
+      column: {
+        type: "number",
+        description: "1-based column (default 1).",
+      },
+    },
+    required: ["path", "line"],
+  },
+  async execute(args, ctx: ToolContext): Promise<ToolResult> {
+    const abs = resolveInWorkspace(ctx.workspaceRoot, args.path);
+    const uri = vscode.Uri.file(abs);
+    const line = Math.max(1, Math.floor(Number(args.line) || 1));
+    const col = Math.max(1, Math.floor(Number(args.column) || 1));
+    // Raw args, not normalized — the prior call is matched on what the model sent.
+    const dup = dedupHit(ctx, "find_references", {
+      path: args.path,
+      line: args.line,
+      column: args.column,
+    });
+    if (dup) return dup;
+    const position = new vscode.Position(line - 1, col - 1);
+
+    // Load the document so the language server is active for this file.
+    try {
+      await vscode.workspace.openTextDocument(uri);
+    } catch (e: any) {
+      return {
+        content: `Error opening ${args.path}: ${e?.message ?? e}`,
+        isError: true,
+      };
+    }
+
+    let references: vscode.Location[] | undefined;
+    try {
+      references = await vscode.commands.executeCommand<vscode.Location[]>(
+        "vscode.executeReferenceProvider",
+        uri,
+        position
+      );
+    } catch (e: any) {
+      return {
+        content: `find_references failed: ${e?.message ?? e}. No language server for this file type, or it is still starting.`,
+        isError: true,
+      };
+    }
+
+    if (!references || references.length === 0) {
+      return { content: `No references found at ${args.path}:${line}:${col}.` };
+    }
+
+    // Group by file and show line text context.
+    const byFile = new Map<string, vscode.Location[]>();
+    for (const ref of references) {
+      let key = ref.uri.fsPath;
+      if (key.startsWith(ctx.workspaceRoot)) {
+        key = toRelative(ctx.workspaceRoot, key);
+      }
+      if (!byFile.has(key)) byFile.set(key, []);
+      byFile.get(key)!.push(ref);
+    }
+
+    const resultLines: string[] = [];
+    let total = 0;
+    for (const [file, locs] of byFile) {
+      if (total >= 80) {
+        resultLines.push(`…and ${references.length - total} more references.`);
+        break;
+      }
+      resultLines.push(`── ${file} ──`);
+      for (const loc of locs.slice(0, 20)) {
+        if (total >= 80) break;
+        const r = loc.range;
+        const refLine = r.start.line + 1;
+        const refCol = r.start.character + 1;
+        // Try to read the source line for context.
+        let lineText = "";
+        try {
+          const doc = await vscode.workspace.openTextDocument(loc.uri);
+          if (r.start.line < doc.lineCount) {
+            lineText = doc.lineAt(r.start.line).text.trim();
+          }
+        } catch {
+          // File may not be open — skip context.
+        }
+        const context = lineText ? `  // ${lineText}` : "";
+        resultLines.push(`  ${file}:${refLine}:${refCol}${context}`);
+        total++;
+      }
+    }
+
+    return {
+      content: `${total} reference(s) for ${args.path}:${line}:${col}:\n` + resultLines.join("\n"),
     };
   },
 };

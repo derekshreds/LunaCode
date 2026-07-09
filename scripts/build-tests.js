@@ -28,6 +28,13 @@ async function main() {
       format: "cjs",
       outfile: "dist/test-checkpoints.js",
     }),
+    esbuild.build({
+      entryPoints: ["scripts/test-loop-guard.ts"],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: "dist/test-loop-guard.js",
+    }),
   ]);
 }
 

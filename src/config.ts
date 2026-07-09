@@ -14,14 +14,27 @@ export interface LunaCodeConfig {
   maxContextTokens: number;
   autoBudgetCarryCostUsd: number;
   compactionTargetRatio: number;
+  /** Soft microcompact trigger as a fraction of the context budget (0 = off). */
+  microcompactRatio: number;
   summarizerModel: string;
   subagentModel: string;
+  /** Cheap model for research/planning iterations; empty = session model. */
+  plannerModel: string;
+  /** Model for implementer sub-agent; empty = session model. */
+  implementerModel: string;
+  /** Sub-agent context budget in tokens (explore/implement). */
+  subagentMaxContextTokens: number;
+  /** Start with read-only tool schemas; expand after first edit/command. */
+  progressiveTools: boolean;
+  /** Lower reasoning effort on pure research follow-up iterations. */
+  adaptiveReasoning: boolean;
   fallbackModels: string[];
   prewarmCache: boolean;
   sessionBudgetUsd: number;
   maxTurns: number;
-  /** Stop a turn if the same file/command is mutated more than this many times
-   * (runaway-loop guard). 0 = disabled. */
+  /** Soft-block a mutating call if the same file/command (or identical call) is
+   * re-issued more than this many times in one turn. Hard-stop only after
+   * consecutive fully-blocked rounds. 0 = disabled. */
   loopGuardLimit: number;
   /** Thinking effort passed to reasoning-capable models. "default" = model's own. */
   reasoningEffort: "default" | "off" | "low" | "medium" | "high";
@@ -57,9 +70,19 @@ export function getConfig(): LunaCodeConfig {
     enablePromptCaching: c.get<boolean>("enablePromptCaching", true),
     maxContextTokens: c.get<number>("maxContextTokens", 0),
     autoBudgetCarryCostUsd: clamp(c.get<number>("autoBudgetCarryCostUsd", 0.1), 0.01, 2, 0.1),
-    compactionTargetRatio: clamp(c.get<number>("compactionTargetRatio", 0.45), 0.2, 0.8, 0.45),
+    compactionTargetRatio: clamp(c.get<number>("compactionTargetRatio", 0.35), 0.2, 0.8, 0.35),
+    // 0 disables; default 0.55 fires content-only stubs before hard compaction.
+    microcompactRatio: clamp(c.get<number>("microcompactRatio", 0.55), 0, 0.95, 0.55),
     summarizerModel: c.get<string>("summarizerModel", "").trim(),
     subagentModel: c.get<string>("subagentModel", "").trim(),
+    plannerModel: c.get<string>("plannerModel", "").trim(),
+    implementerModel: c.get<string>("implementerModel", "").trim(),
+    subagentMaxContextTokens: Math.max(
+      8_000,
+      Math.floor(c.get<number>("subagentMaxContextTokens", 60_000) || 60_000)
+    ),
+    progressiveTools: c.get<boolean>("progressiveTools", true),
+    adaptiveReasoning: c.get<boolean>("adaptiveReasoning", true),
     fallbackModels: (c.get<string[]>("fallbackModels", []) ?? []).filter(Boolean),
     prewarmCache: c.get<boolean>("prewarmCache", false),
     sessionBudgetUsd: Math.max(0, c.get<number>("sessionBudgetUsd", 0) || 0),
@@ -115,6 +138,12 @@ export async function setModel(model: string): Promise<void> {
   await vscode.workspace
     .getConfiguration("lunacode")
     .update("model", model, vscode.ConfigurationTarget.Global);
+}
+
+export async function setSubagentModel(model: string): Promise<void> {
+  await vscode.workspace
+    .getConfiguration("lunacode")
+    .update("subagentModel", model, vscode.ConfigurationTarget.Global);
 }
 
 export class SecretStore {

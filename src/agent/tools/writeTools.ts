@@ -4,6 +4,7 @@ import * as path from "path";
 import { Tool, ToolContext, ToolResult } from "./types";
 import { fileExists, resolveInWorkspace } from "./util";
 import { computeDiff } from "../../diff";
+import { planLineRangeReplace, planStringReplace } from "../editMatch";
 
 /**
  * Write file contents. If the file is currently open in the editor, route the
@@ -33,13 +34,14 @@ async function writeFileContents(abs: string, content: string): Promise<void> {
 export const writeFileTool: Tool = {
   name: "write_file",
   description:
-    "Create a new file or completely overwrite an existing file with the given contents. Prefer edit_file for targeted changes to existing files. Parent directories are created automatically.",
+    "Create or overwrite a file. Prefer edit_file for targeted changes.",
   mutating: true,
+  group: "edit",
   parameters: {
     type: "object",
     properties: {
-      path: { type: "string", description: "Workspace-relative file path." },
-      content: { type: "string", description: "Full file contents to write." },
+      path: { type: "string", description: "Workspace-relative path." },
+      content: { type: "string", description: "Full file contents." },
     },
     required: ["path", "content"],
   },
@@ -77,8 +79,9 @@ interface PatchChange {
 export const applyPatchTool: Tool = {
   name: "apply_patch",
   description:
-    "Apply changes to MULTIPLE files in ONE call — much cheaper and faster than sequential edit_file calls when a change spans files (each extra round-trip re-sends the whole conversation). Each change either edits an existing file via exact old_string→new_string replacements, or creates/overwrites a file by giving full content. Files whose edits don't match are skipped and reported; the rest still apply.",
+    "Apply edits to MULTIPLE files in one call. Each change is old_string→new_string edits or full content.",
   mutating: true,
+  group: "edit",
   parameters: {
     type: "object",
     properties: {
@@ -87,10 +90,10 @@ export const applyPatchTool: Tool = {
         items: {
           type: "object",
           properties: {
-            path: { type: "string", description: "Workspace-relative file path." },
+            path: { type: "string", description: "Workspace-relative path." },
             edits: {
               type: "array",
-              description: "Exact-string replacements to apply to an existing file, in order.",
+              description: "Exact-string replacements.",
               items: {
                 type: "object",
                 properties: {
@@ -103,7 +106,7 @@ export const applyPatchTool: Tool = {
             },
             content: {
               type: "string",
-              description: "Full contents — creates or overwrites the file (instead of edits).",
+              description: "Full contents (instead of edits).",
             },
           },
           required: ["path"],
@@ -155,17 +158,13 @@ export const applyPatchTool: Tool = {
       let replacements = 0;
       let error: string | undefined;
       for (const e of change.edits) {
-        const count = text.split(e.old_string).length - 1;
-        if (count === 0) {
-          error = `old_string not found: "${e.old_string.slice(0, 60)}${e.old_string.length > 60 ? "…" : ""}"`;
+        const plan = planStringReplace(text, e.old_string, e.new_string, !!e.replace_all);
+        if (!plan.ok) {
+          error = plan.reason;
           break;
         }
-        if (count > 1 && !e.replace_all) {
-          error = `old_string appears ${count} times (add context or replace_all): "${e.old_string.slice(0, 60)}…"`;
-          break;
-        }
-        text = e.replace_all ? text.split(e.old_string).join(e.new_string) : text.replace(e.old_string, e.new_string);
-        replacements += e.replace_all ? count : 1;
+        text = plan.after;
+        replacements += plan.count;
       }
       prepared.push({ change, abs, before, after: text, existed, replacements, error });
     }
@@ -222,23 +221,33 @@ export const applyPatchTool: Tool = {
 export const editFileTool: Tool = {
   name: "edit_file",
   description:
-    "Make a targeted edit to an existing file by replacing an exact string. The old_string must appear EXACTLY ONCE (include enough surrounding context to be unique). Set replace_all to replace every occurrence. This is the preferred way to modify existing files.",
+    "Targeted edit: exact old_string→new_string, or start_line+end_line with new_string for a line-range replace.",
   mutating: true,
+  group: "edit",
   parameters: {
     type: "object",
     properties: {
-      path: { type: "string", description: "Workspace-relative file path." },
+      path: { type: "string", description: "Workspace-relative path." },
       old_string: {
         type: "string",
-        description: "Exact text to find. Must be unique unless replace_all is true.",
+        description:
+          "Exact text to find (unique unless replace_all); required unless start_line/end_line.",
       },
       new_string: { type: "string", description: "Replacement text." },
       replace_all: {
         type: "boolean",
-        description: "Replace all occurrences instead of requiring uniqueness.",
+        description: "Replace all occurrences.",
+      },
+      start_line: {
+        type: "number",
+        description: "1-based start for line-range replace (with end_line; ignores old_string).",
+      },
+      end_line: {
+        type: "number",
+        description: "1-based inclusive end for line-range replace.",
       },
     },
-    required: ["path", "old_string", "new_string"],
+    required: ["path", "new_string"],
   },
   async execute(args, ctx): Promise<ToolResult> {
     const abs = resolveInWorkspace(ctx.workspaceRoot, args.path);
@@ -249,30 +258,34 @@ export const editFileTool: Tool = {
       return { content: `Cannot edit ${args.path}: ${e.message}`, isError: true };
     }
 
-    if (args.old_string === args.new_string) {
-      return { content: "old_string and new_string are identical; nothing to do.", isError: true };
+    const newString = typeof args.new_string === "string" ? args.new_string : "";
+    const useLines =
+      args.start_line != null &&
+      args.end_line != null &&
+      Number.isFinite(Number(args.start_line)) &&
+      Number.isFinite(Number(args.end_line));
+
+    let plan;
+    if (useLines) {
+      plan = planLineRangeReplace(before, Number(args.start_line), Number(args.end_line), newString);
+    } else {
+      if (typeof args.old_string !== "string" || args.old_string.length === 0) {
+        return {
+          content:
+            "edit_file requires a non-empty old_string (string replace) OR both start_line and end_line (line-range replace). " +
+            "new_string alone is not enough — re-issue with the exact text to replace, or a line range from a prior read_file.",
+          isError: true,
+        };
+      }
+      plan = planStringReplace(before, args.old_string, newString, !!args.replace_all);
     }
 
-    const count = before.split(args.old_string).length - 1;
-    if (count === 0) {
-      return {
-        content: `old_string not found in ${args.path}. Read the file and copy the exact text (including whitespace).`,
-        isError: true,
-      };
+    if (!plan.ok) {
+      return { content: `${plan.reason} (file: ${args.path})`, isError: true };
     }
-    if (count > 1 && !args.replace_all) {
-      return {
-        content: `old_string appears ${count} times in ${args.path}. Add more surrounding context to make it unique, or set replace_all: true.`,
-        isError: true,
-      };
-    }
-
-    const after = args.replace_all
-      ? before.split(args.old_string).join(args.new_string)
-      : before.replace(args.old_string, args.new_string);
 
     // Diff the WHOLE file before/after so line numbers and context are real.
-    const diff = computeDiff(before, after, args.path);
+    const diff = computeDiff(before, plan.after, args.path);
 
     const decision = await ctx.requestApproval({
       kind: "edit",
@@ -284,10 +297,14 @@ export const editFileTool: Tool = {
       return { content: `User rejected editing ${args.path}.`, isError: true };
     }
 
-    await writeFileContents(abs, after);
+    await writeFileContents(abs, plan.after);
+    const modeNote = plan.mode === "fuzzy" ? " via whitespace-fuzzy match" : "";
+    const rangeNote = useLines
+      ? ` lines ${args.start_line}-${args.end_line}`
+      : ` (${plan.count} replacement${plan.count === 1 ? "" : "s"}${modeNote})`;
     return {
-      content: `Edited ${args.path} (${count} replacement${count === 1 ? "" : "s"}).`,
-      ui: { path: args.path, action: "edit", replacements: count, diff },
+      content: `Edited ${args.path}${rangeNote}.`,
+      ui: { path: args.path, action: "edit", replacements: plan.count, diff },
     };
   },
 };
