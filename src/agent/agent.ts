@@ -1,8 +1,9 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
-import { OpenRouterClient, isTransientFrame } from "../openrouter/client";
+import { OpenRouterClient, isTransientFrame, usesCacheControl } from "../openrouter/client";
 import {
   AssistantMessage,
+  ChatMessage,
   ToolCall,
   Usage,
 } from "../openrouter/types";
@@ -26,7 +27,17 @@ import { IGNORED_DIRS, readCacheInvalidatePath, truncateHeadTail } from "./tools
 import { runSubagent } from "./subagent";
 import { LoopGuard } from "./loopGuard";
 import { AgentMode, MODES } from "../modes";
-import { StickyMemory, applyStickyUpdate } from "./stickyMemory";
+import {
+  StickyMemory,
+  applyStickyUpdate,
+  renderStickyMemory,
+  stickyIsEmpty,
+} from "./stickyMemory";
+
+/** Header for STORED scratchpad snapshots (implicit-cache models). Matches the
+ * ephemeral tail's wording so the model treats both forms identically. */
+const SCRATCHPAD_HEADER =
+  "[Session scratchpad — auto-maintained state, not a user message]";
 
 /** Tools whose success should trigger snapshot/format/diagnostics handling. */
 const EDIT_TOOLS = new Set(["write_file", "edit_file", "apply_patch"]);
@@ -80,7 +91,6 @@ export type AgentEvent =
       model?: string;
     }
   | { type: "compaction"; tokensSaved: number; summarized: boolean; deduped: number }
-  | { type: "microcompact"; tokensSaved: number; stubbed: number }
   | { type: "tasks"; tasks: TaskItem[] }
   /** Live generation progress (throttled) — includes tool-call argument
    * streaming, which otherwise produces no visible output. */
@@ -113,10 +123,6 @@ export interface AgentDeps {
   summarizerModel: string;
   /** Fraction of the budget to compact down to when an event fires. */
   compactionTargetRatio: number;
-  /** Soft microcompact trigger as a fraction of maxContextTokens (0 = off).
-   * When estimate exceeds this, content-only stubs free tokens before the hard
-   * compaction event. */
-  microcompactRatio?: number;
   /** Model for the explore research sub-agent; "" = the session model. */
   subagentModel: string;
   /**
@@ -165,9 +171,43 @@ export interface AgentDeps {
   stickyMemory?: StickyMemory;
   /** Rebuild system prompt (e.g. after sticky memory / compaction). */
   refreshSystemPrompt?: () => void | Promise<void>;
+  /** Session-lived store of per-model render digests for cache diagnostics.
+   * Must outlive the Agent (rebuilt every turn) so cross-turn prefix
+   * divergence — the expensive kind — is detected too. */
+  cacheDigests?: Map<string, string[]>;
 }
 
 const DEFAULT_MAX_TURNS = 200;
+
+/** FNV-1a 32-bit — cheap, dependency-free per-message digest for the cache
+ * diagnostics below. Not cryptographic; collisions only risk a missed log line. */
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+
+/** Canonicalize a rendered message for digesting: drop cache_control marks and
+ * flatten single-text-part arrays back to plain strings. The rolling
+ * breakpoint MOVING between calls re-shapes a message without changing its
+ * content — providers tokenize both forms identically, so it must not be
+ * reported as prefix divergence. */
+function normalizeForDigest(m: ChatMessage): unknown {
+  const clone: any = { ...m };
+  const c = clone.content;
+  if (Array.isArray(c)) {
+    const parts = c.map((p: any) => {
+      const { cache_control: _cc, ...rest } = p;
+      return rest;
+    });
+    clone.content =
+      parts.length === 1 && parts[0]?.type === "text" ? parts[0].text : parts;
+  }
+  return clone;
+}
 
 /**
  * Drives a single user turn to completion: streams assistant output, executes
@@ -204,11 +244,73 @@ export class Agent {
   private dirtySinceVerify = new Set<string>();
   /** Last status message this turn — skip consecutive identical ones. */
   private lastStatus = "";
+  /** Fallback digest store when the controller doesn't supply a session-lived
+   * one (e.g. tests) — covers within-turn diagnostics only. */
+  private localCacheDigests = new Map<string, string[]>();
 
   constructor(private deps: AgentDeps, private cb: AgentCallbacks) {}
 
+  /**
+   * Cache diagnostics: log whether this request's rendered messages are a
+   * pure prefix-extension of the previous request on the same model. Between
+   * compaction events every call MUST extend the previous one — a DIVERGED
+   * line anywhere else means the provider prompt cache was invalidated and
+   * everything after the divergence point re-bills at the uncached rate.
+   */
+  private diagnoseCachePrefix(modelKey: string, rendered: ChatMessage[]): void {
+    // Exclude the ephemeral scratchpad tail: volatile by design and rendered
+    // past every breakpoint, so it never affects the cached prefix.
+    let msgs = rendered;
+    const last = rendered[rendered.length - 1] as any;
+    if (
+      last?.role === "user" &&
+      typeof last.content === "string" &&
+      last.content.startsWith("[Session scratchpad")
+    ) {
+      msgs = rendered.slice(0, -1);
+    }
+    const store = this.deps.cacheDigests ?? this.localCacheDigests;
+    const digests = msgs.map((m) => fnv1a(JSON.stringify(normalizeForDigest(m))));
+    const prev = store.get(modelKey);
+    store.set(modelKey, digests);
+    if (!prev) {
+      this.deps.output.appendLine(
+        `[cache] ${modelKey}: first call this session (${digests.length} messages)`
+      );
+      return;
+    }
+    let i = 0;
+    while (i < prev.length && i < digests.length && prev[i] === digests[i]) i++;
+    if (i < prev.length) {
+      this.deps.output.appendLine(
+        `[cache] ${modelKey}: DIVERGED at message ${i}/${prev.length} ` +
+          `(role=${(msgs[i] as any)?.role ?? "removed"}) — prompt cache lost from here ` +
+          `(expected only after a compaction event or user rewind)`
+      );
+    } else {
+      this.deps.output.appendLine(
+        `[cache] ${modelKey}: prefix stable through ${prev.length} messages, ` +
+          `+${digests.length - prev.length} appended`
+      );
+    }
+  }
+
   cancel() {
     this.abort?.abort();
+  }
+
+  /** Body of the most recent stored scratchpad snapshot, or "" — used to skip
+   * re-injecting an unchanged scratchpad on the next turn. */
+  private lastStickySnapshot(): string {
+    const msgs = this.deps.context.getMessages();
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m.role !== "assistant" || typeof m.content !== "string") continue;
+      if (m.content.startsWith(SCRATCHPAD_HEADER)) {
+        return m.content.slice(SCRATCHPAD_HEADER.length + 1);
+      }
+    }
+    return "";
   }
 
   /** Throttled live-progress counter (covers silent tool-arg streaming). */
@@ -261,6 +363,18 @@ export class Agent {
     this.dirtySinceVerify.clear();
     this.lastDiagReport.clear();
     this.lastStatus = "";
+    // Implicit-prefix-cache models (OpenAI et al.) never receive the volatile
+    // ephemeral tail (it would poison every cached prefix — see render()), so
+    // hand them the scratchpad as a STORED message instead: appended once per
+    // turn, it rides the append-only history and caches like everything else.
+    // Captured BEFORE goal seeding so the first turn (scratchpad empty until
+    // now) injects nothing; skipped when unchanged since the last injection.
+    const stickySnapshot =
+      this.deps.stickyMemory &&
+      !usesCacheControl(this.deps.client.model) &&
+      !stickyIsEmpty(this.deps.stickyMemory)
+        ? renderStickyMemory(this.deps.stickyMemory)
+        : "";
     // Seed sticky goal from the user turn when empty.
     if (this.deps.stickyMemory && !this.deps.stickyMemory.goal) {
       applyStickyUpdate(this.deps.stickyMemory, {
@@ -268,6 +382,12 @@ export class Agent {
       });
     }
     this.deps.context.addUser(userText, images, { turnStart: true });
+    if (stickySnapshot && stickySnapshot !== this.lastStickySnapshot()) {
+      this.deps.context.addAssistant({
+        role: "assistant",
+        content: `${SCRATCHPAD_HEADER}\n${stickySnapshot}`,
+      });
+    }
     this.cb.onEvent({ type: "turn_start" });
 
     const allowsMutation = MODES[mode].allowsMutation;
@@ -349,23 +469,6 @@ export class Agent {
           this.cb.onEvent({ type: "steering" });
         }
 
-        // Soft microcompact first: content-only stubs when we're past the soft
-        // threshold but still under the hard budget. One intentional cache miss
-        // so subsequent turns re-cache a smaller prefix.
-        const softRatio = this.deps.microcompactRatio ?? 0;
-        if (softRatio > 0) {
-          const micro = this.deps.context.microcompactIfNeeded(
-            this.deps.maxContextTokens,
-            softRatio
-          );
-          if (micro && (micro.tokensSaved > 0 || micro.stubbed > 0)) {
-            this.cb.onEvent({ type: "microcompact", ...micro });
-            this.emitStatus(
-              `Microcompacted context (stubbed ${micro.stubbed} result${micro.stubbed === 1 ? "" : "s"}, ~${Math.round(micro.tokensSaved / 1000)}k tokens freed).`
-            );
-          }
-        }
-
         // Hard compaction event: mutates history only when the budget is
         // exceeded; otherwise history stays append-only so the provider prompt
         // cache keeps hitting.
@@ -436,9 +539,20 @@ export class Agent {
               ? planner
               : undefined; // undefined = session primary
 
-        // Adaptive reasoning: lower effort on pure tool-follow-up research steps.
+        // Adaptive reasoning: lower effort on pure tool-follow-up research
+        // steps — but ONLY on planner-model calls. The planner is a different
+        // model (separate prompt cache), so varying its reasoning costs
+        // nothing extra. The primary model's request params must stay
+        // byte-stable call-to-call: on Anthropic, any thinking-budget change
+        // invalidates the message cache, turning every toggle into a full
+        // uncached re-read of the conversation.
         let callReasoning = this.deps.reasoningEffort;
-        if (this.deps.adaptiveReasoning && this.readOnlyStreak >= 2 && !this.sawImplement) {
+        if (
+          this.deps.adaptiveReasoning &&
+          callModel &&
+          this.readOnlyStreak >= 2 &&
+          !this.sawImplement
+        ) {
           if (!callReasoning || callReasoning === "high" || callReasoning === "medium") {
             callReasoning = "low";
           }
@@ -467,8 +581,15 @@ export class Agent {
         // prompt_tokens to self-calibrate the token estimator.
         const sentChars =
           this.deps.context.renderChars() + JSON.stringify(toolDefs).length;
+        // The volatile scratchpad tail only rides on cache_control providers;
+        // implicit exact-prefix caches (OpenAI GPT-5.6+ especially) would
+        // re-cache the entire prompt every call and never read it back.
+        const rendered = this.deps.context.render({
+          volatileTail: usesCacheControl(callModel ?? this.deps.client.model),
+        });
+        this.diagnoseCachePrefix(callModel ?? "primary", rendered);
         for await (const ev of this.deps.client.stream({
-          messages: this.deps.context.render(),
+          messages: rendered,
           tools: toolDefs,
           temperature: this.deps.temperature,
           maxTokens: this.deps.maxTokens,
@@ -480,6 +601,13 @@ export class Agent {
             case "model":
               servedModel = ev.id;
               this.emitStatus(`Primary model unavailable — served by fallback ${ev.id}.`);
+              break;
+            case "provider":
+              // Cache diagnostics: a provider change between calls means the
+              // new provider's prompt cache is cold even with a perfect prefix.
+              this.deps.output.appendLine(
+                `[cache] ${callModel ?? "primary"}: served by provider=${ev.name}`
+              );
               break;
             case "text":
               textBuf += ev.delta;
@@ -516,7 +644,7 @@ export class Agent {
               this.trackProgress(ev.argsDelta.length);
               break;
             }
-            case "usage":
+            case "usage": {
               usageSeen = true;
               // Calibrate only on the session's primary model — the planner /
               // a fallback may tokenize differently. (The clamp inside makes a
@@ -524,6 +652,14 @@ export class Agent {
               if (!callModel && !servedModel) {
                 this.deps.context.noteObservedUsage(sentChars, ev.usage.prompt_tokens);
               }
+              // Per-call cache accounting. Healthy steady state: read ≈ the
+              // whole prior prefix, write ≈ just this call's new content.
+              // write>0 with read=0 on every call = the prefix never matches.
+              const det = ev.usage.prompt_tokens_details;
+              this.deps.output.appendLine(
+                `[cache] ${callModel ?? "primary"}: prompt=${ev.usage.prompt_tokens} ` +
+                  `read=${det?.cached_tokens ?? 0} write=${det?.cache_write_tokens ?? 0}`
+              );
               this.cb.onEvent({
                 type: "usage",
                 usage: ev.usage,
@@ -531,9 +667,13 @@ export class Agent {
                   ev.usage.prompt_tokens_details?.cached_tokens ??
                   ev.usage.cache_read_input_tokens ??
                   0,
-                model: servedModel ?? undefined,
+                // Attribute planner-routed calls to the planner model — booking
+                // them under the primary hides dual-model routing in the usage
+                // report (exactly what masked the 0%-cache-hit incident).
+                model: servedModel ?? callModel ?? undefined,
               });
               break;
+            }
             case "retry":
               this.emitStatus(
                 `${ev.reason} — retrying (attempt ${ev.attempt + 1} of ${ev.maxAttempts})…`
@@ -573,7 +713,7 @@ export class Agent {
                   cost: u.cost,
                 },
                 cachedTokens: u.cachedTokens,
-                model: servedModel ?? undefined,
+                model: servedModel ?? callModel ?? undefined,
               });
             }
           }
@@ -945,9 +1085,11 @@ export class Agent {
       }
       let content = result.content;
       if (!result.isError && paths.length) {
-        // Stub prior large reads of these paths so pre-edit contents stop
-        // bloating the context (content-only; may miss the prompt cache once).
-        this.deps.context.invalidateFileReads(paths, 800);
+        // NOTE: prior reads of these paths are NOT stubbed here — message
+        // history must stay append-only between compaction events or the
+        // provider prompt cache misses from the mutated message onward on
+        // every subsequent call. compactIfNeeded's supersession pass stubs
+        // pre-edit reads at the next planned cache miss instead.
         // Invalidate the in-memory read cache so subsequent reads fetch fresh data.
         for (const p of paths) readCacheInvalidatePath(p);
         // Optional: match project style before checking diagnostics — format

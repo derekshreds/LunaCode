@@ -1406,8 +1406,14 @@ function showUsage(report: UsageReport) {
       const lines = m.linesAdded || m.linesRemoved
         ? ` · +${fmtLines(m.linesAdded)}/−${fmtLines(m.linesRemoved)} lines`
         : "";
+      // Per-model cache hit rate — the primary model sitting near 0% while
+      // others look healthy is the signature of a cache regression.
+      const cache =
+        (m.prompt ?? 0) > 0
+          ? ` · ${Math.round(((m.cached ?? 0) / m.prompt) * 100)}% cached`
+          : "";
       row.appendChild(
-        el("div", "model-sub", `${fmtTokens(m.tokens)} tokens · ${m.count} turns${lines}`)
+        el("div", "model-sub", `${fmtTokens(m.tokens)} tokens · ${m.count} turns${cache}${lines}`)
       );
       modelWrap.appendChild(row);
     }
@@ -1681,15 +1687,6 @@ function showSettings(s: SettingsPayload) {
       "Each compaction event shrinks the context to this fraction of the budget. Lower = rarer compactions.",
       sliderSetting("compactionTargetRatio", s.compactionTargetRatio, 0.2, 0.8, 0.05, (n) =>
         Math.round(n * 100) + "%"
-      )
-    )
-  );
-  ctx.appendChild(
-    setRow(
-      "Microcompact threshold",
-      "Soft cleanup: stub superseded/stale tool results when context exceeds this fraction of the budget. 0 = off.",
-      sliderSetting("microcompactRatio", s.microcompactRatio, 0, 0.95, 0.05, (n) =>
-        n === 0 ? "off" : Math.round(n * 100) + "%"
       )
     )
   );
@@ -2120,7 +2117,7 @@ function showContextInfo(info: ContextInfo) {
       el(
         "div",
         "set-hint",
-        "Every API call re-reads everything above (cached reads ≈ 10% of input price). Microcompact stubs stale tool results; hard compaction summarizes at the budget."
+        "Every API call re-reads everything above (cached reads ≈ 10% of input price). History is append-only between compactions so those reads stay cached; hard compaction summarizes at the budget."
       )
     );
   }

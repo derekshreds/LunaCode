@@ -153,6 +153,177 @@ async function compactionTests() {
   }
 }
 
+/** Mirror agent.ts's cache-diagnostic normalization: drop the ephemeral tail,
+ * strip cache_control, flatten single-text-part arrays. Two renders that
+ * differ only in breakpoint placement / tail content must normalize equal. */
+function normalizeRender(msgs: ChatMessage[]): string[] {
+  const withoutTail = msgs.filter(
+    (m, i) =>
+      !(
+        i === msgs.length - 1 &&
+        m.role === "user" &&
+        typeof m.content === "string" &&
+        m.content.startsWith("[Session scratchpad")
+      )
+  );
+  return withoutTail.map((m) => {
+    const clone: any = { ...m };
+    if (Array.isArray(clone.content)) {
+      const parts = clone.content.map((p: any) => {
+        const { cache_control: _cc, ...rest } = p;
+        return rest;
+      });
+      clone.content =
+        parts.length === 1 && parts[0]?.type === "text" ? parts[0].text : parts;
+    }
+    return JSON.stringify(clone);
+  });
+}
+
+function isPrefixOf(a: string[], b: string[]): boolean {
+  return a.length <= b.length && a.every((x, i) => b[i] === x);
+}
+
+/** The core cache invariant: between compaction events, every render is a pure
+ * prefix-extension of the previous one — across iterations, turn boundaries,
+ * edits, and a changing scratchpad tail. Any violation = a prompt-cache miss
+ * from the divergence point on every later call. */
+async function appendOnlyTests() {
+  console.log("Append-only prefix-extension invariant (no compaction event):");
+  {
+    const cm = new ContextManager(true);
+    cm.setSystemPrompt("SYS");
+    let tail = "Goal: v1";
+    cm.setEphemeralTail(() => tail);
+
+    cm.addUser("turn one", undefined, { turnStart: true });
+    cm.addAssistant({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "r1", type: "function", function: { name: "read_file", arguments: `{"path":"a.ts"}` } },
+      ],
+    });
+    cm.addToolResult("r1", "A".repeat(3000));
+    const r1 = normalizeRender(cm.render());
+
+    // Iteration boundary: assistant answer appended, tail changed.
+    tail = "Goal: v2 (changed)";
+    cm.addAssistant({ role: "assistant", content: "found it" });
+    const r2 = normalizeRender(cm.render());
+    assert(isPrefixOf(r1, r2), "render N is a prefix of render N+1 within a turn");
+
+    // Turn boundary + an edit of a previously-read file: still append-only.
+    cm.addUser("turn two — now edit it", undefined, { turnStart: true });
+    cm.addAssistant({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "e1", type: "function", function: { name: "edit_file", arguments: `{"path":"a.ts"}` } },
+      ],
+    });
+    cm.addToolResult("e1", "edited ok");
+    const r3 = normalizeRender(cm.render());
+    assert(isPrefixOf(r2, r3), "prefix survives a turn boundary");
+    assert(isPrefixOf(r1, r3), "prefix survives transitively across the session");
+    const readMsg = cm.getMessages().find((m) => m.role === "tool" && m.tool_call_id === "r1");
+    assert(
+      !!readMsg && typeof readMsg.content === "string" && readMsg.content.startsWith("AAA"),
+      "editing a file does NOT rewrite its earlier read in place"
+    );
+  }
+
+  console.log("No mutation below the hard budget:");
+  {
+    const cm = new ContextManager(true);
+    cm.setSystemPrompt("SYS");
+    cm.addUser("start");
+    cm.addAssistant({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "r1", type: "function", function: { name: "read_file", arguments: `{"path":"b.ts"}` } },
+        { id: "e1", type: "function", function: { name: "edit_file", arguments: `{"path":"b.ts"}` } },
+      ],
+    });
+    cm.addToolResult("r1", "B".repeat(5000));
+    cm.addToolResult("e1", "edited ok");
+    cm.addUser("next");
+    const snapshot = JSON.stringify(cm.getMessages());
+    const result = await cm.compactIfNeeded(1_000_000, { targetRatio: 0.35 });
+    assert(result === null, "no compaction event fires under budget");
+    assert(
+      JSON.stringify(cm.getMessages()) === snapshot,
+      "history byte-identical under budget — even with a read→edit pair present"
+    );
+  }
+
+  console.log("Compaction event batches ALL content stubs:");
+  {
+    // (a) Pre-edit reads are stubbed by the supersession pass AT the event —
+    // this replaces the removed immediate invalidateFileReads path.
+    const cm = new ContextManager(true);
+    cm.setSystemPrompt("SYS");
+    cm.addUser("start");
+    for (let i = 0; i < 10; i++) {
+      const id = `f${i}`;
+      cm.addAssistant({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id, type: "function", function: { name: "grep", arguments: `{"pattern":"p${i}"}` } },
+        ],
+      });
+      cm.addToolResult(id, "X".repeat(2500));
+    }
+    cm.addAssistant({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "rb", type: "function", function: { name: "read_file", arguments: `{"path":"b.ts"}` } },
+      ],
+    });
+    cm.addToolResult("rb", "B".repeat(3000));
+    cm.addAssistant({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "eb", type: "function", function: { name: "edit_file", arguments: `{"path":"b.ts"}` } },
+      ],
+    });
+    cm.addToolResult("eb", "edited ok");
+    cm.addUser("final question");
+
+    // Budget just under the estimate: the event fires, Pass A shrinks the
+    // history far below the (high-ratio) target, so no span is summarized and
+    // the stubs stay observable.
+    const budget = cm.estimate() - 200;
+    const result = await cm.compactIfNeeded(budget, {
+      targetRatio: 0.8,
+      summarize: async () => ({ text: "checkpoint" }),
+    });
+    assert(result !== null, "compaction event fired just over budget");
+    const readB = cm.getMessages().find((m) => m.role === "tool" && m.tool_call_id === "rb");
+    assert(
+      !!readB && typeof readB.content === "string" && readB.content.startsWith("[stale:"),
+      "pre-edit read stubbed as stale AT the event (supersession covers edit invalidation)"
+    );
+    // (b) Large older tool results are truncated by the same event (the fold
+    // that replaced per-call microcompact).
+    const truncated = cm
+      .getMessages()
+      .filter(
+        (m) =>
+          m.role === "tool" &&
+          typeof m.content === "string" &&
+          m.content.includes("[older tool output truncated")
+      );
+    assert(truncated.length > 0, `large older results truncated at the event (${truncated.length})`);
+    assert(result!.deduped >= truncated.length + 1, "stub count reported on the event");
+    checkInvariants([{ role: "system", content: "SYS" }, ...cm.getMessages()], "post-event");
+  }
+}
+
 console.log("Cache breakpoint placement:");
 {
   const cm = new ContextManager(true);
@@ -219,6 +390,13 @@ console.log("Ephemeral tail:");
     JSON.stringify(rendered2.slice(0, -1)) === JSON.stringify(rendered.slice(0, -1)),
     "prefix bytes identical across tail changes (cache-stable)"
   );
+  // Implicit exact-prefix caching providers (OpenAI): tail suppressed per call.
+  const noTail = cm.render({ volatileTail: false });
+  assert(
+    noTail.length === rendered.length - 1 &&
+      noTail[noTail.length - 1].role === "assistant",
+    "volatileTail:false omits the tail message"
+  );
   // Empty tail → no extra message.
   tail = "";
   const rendered3 = cm.render();
@@ -244,6 +422,7 @@ console.log("Self-calibrating estimator:");
 }
 
 compactionTests()
+  .then(() => appendOnlyTests())
   .then(() => {
     if (failures) {
       console.error(`\n${failures} assertion(s) failed.`);

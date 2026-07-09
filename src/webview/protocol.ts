@@ -73,6 +73,10 @@ export interface ModelPoint {
   count: number;
   linesAdded: number;
   linesRemoved: number;
+  /** Prompt tokens sent / prompt tokens served from cache — the per-model
+   * cache hit rate (cached/prompt) that catches cache regressions early. */
+  prompt: number;
+  cached: number;
 }
 export interface UsageReport {
   days: number;
@@ -137,7 +141,6 @@ export interface SettingsPayload {
   maxContextTokens: number;
   autoBudgetCarryCostUsd: number;
   compactionTargetRatio: number;
-  microcompactRatio: number;
   maxTokens: number;
   temperature: number;
   enablePromptCaching: boolean;

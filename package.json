@@ -334,13 +334,6 @@
           "maximum": 0.8,
           "description": "When a compaction event fires, the context is reduced to this fraction of the budget. Lower = rarer compactions (better prompt-cache economics) but more history summarized away."
         },
-        "lunacode.microcompactRatio": {
-          "type": "number",
-          "default": 0.55,
-          "minimum": 0,
-          "maximum": 0.95,
-          "description": "Soft context cleanup: when estimated tokens exceed this fraction of the budget, Luna Code stubs superseded/stale tool results and truncates large older outputs (content-only — one prompt-cache miss). 0 disables. Hard compaction (summarize/drop) still fires at the full budget."
-        },
         "lunacode.summarizerModel": {
           "type": "string",
           "default": "",
@@ -349,12 +342,12 @@
         "lunacode.subagentModel": {
           "type": "string",
           "default": "",
-          "description": "OpenRouter model id for research sub-agents (explore tool — including parallel multi-question explores). A fast, cheap model works well here. Empty = use the currently selected session model."
+          "description": "OpenRouter model id for research sub-agents (explore tool — including parallel multi-question explores). A fast, cheap model works well here. Used ONLY by explore/implement sub-agents (which run isolated contexts) — it never routes the main conversation. Empty = use the currently selected session model."
         },
         "lunacode.plannerModel": {
           "type": "string",
           "default": "",
-          "description": "Cheap model for research/planning iterations of the main agent loop. When set, read-only phases route here; implement phases stay on the primary model. Empty = always use the session model. Often the same as subagentModel. Note: provider prompt caches are per-model, so each swap between planner and primary re-reads the conversation uncached on the other model — on long sessions the cheaper rate may not beat the lost cache hits."
+          "description": "Cheap model for research/planning iterations of the main agent loop. When set, read-only phases route here; implement phases stay on the primary model. Empty (default) = always use the session model — setting subagentModel does NOT enable this. Note: provider prompt caches are per-model, so each swap between planner and primary re-reads the conversation uncached on the other model — on long sessions the cheaper rate may not beat the lost cache hits."
         },
         "lunacode.implementerModel": {
           "type": "string",
@@ -375,7 +368,7 @@
         "lunacode.adaptiveReasoning": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically lower reasoning effort on pure research follow-up iterations (saves cost on reasoning-capable models). Raises back when implementing."
+          "description": "Automatically lower reasoning effort on pure research follow-up iterations (saves cost on reasoning-capable models). Applies only when a separate plannerModel handles those iterations — the primary model's reasoning setting never varies mid-session, protecting its prompt cache."
         },
         "lunacode.sessionBudgetUsd": {
           "type": "number",

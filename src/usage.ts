@@ -101,7 +101,16 @@ export class UsageStore {
     const model = (name: string): ModelPoint => {
       let m = modelMap.get(name);
       if (!m) {
-        m = { model: name, cost: 0, tokens: 0, count: 0, linesAdded: 0, linesRemoved: 0 };
+        m = {
+          model: name,
+          cost: 0,
+          tokens: 0,
+          count: 0,
+          linesAdded: 0,
+          linesRemoved: 0,
+          prompt: 0,
+          cached: 0,
+        };
         modelMap.set(name, m);
       }
       return m;
@@ -124,6 +133,8 @@ export class UsageStore {
       m.cost += e.cost || 0;
       m.tokens += (e.prompt || 0) + (e.completion || 0);
       m.count += 1;
+      m.prompt += e.prompt || 0;
+      m.cached += e.cached || 0;
     }
 
     for (const e of codeEvents) {

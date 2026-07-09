@@ -29,6 +29,11 @@ export interface OpenRouterClientOptions {
    * low/medium/high map to OpenRouter's unified `reasoning.effort`. Undefined =
    * the model's default. */
   reasoningEffort?: "off" | "low" | "medium" | "high";
+  /** Session-stable key for OpenAI's automatic prompt-cache routing. OpenAI
+   * routes by prompt-prefix hash + this key, and GPT-5.6+ effectively require
+   * it — without one, hit rates collapse to ~0% even with a byte-identical
+   * prefix. Only sent on openai/ models; other providers use cache_control. */
+  promptCacheKey?: string;
   /** Override the stall watchdog (ms without a data frame); for tests. */
   stallTimeoutMs?: number;
 }
@@ -56,6 +61,18 @@ export function isTransientFrame(message: string, code?: number): boolean {
   return /timeout|timed out|overloaded|unavailable|too many|rate.?limit|try again|appears hung|no data|stall|terminated|socket|econn|network/i.test(
     message
   );
+}
+
+/** True when the model's prompt caching is driven by explicit `cache_control`
+ * breakpoints that OpenRouter forwards (Anthropic, Gemini via Vertex). Every
+ * other provider (OpenAI, Grok, Groq, DeepSeek, …) uses implicit exact-prefix
+ * caching, where ANY volatile render-time content — even past the last
+ * breakpoint — poisons the cached entry: on OpenAI GPT-5.6+ the automatic
+ * cache entry is keyed at the LATEST message and reads require an exact
+ * prefix match, so a trailing message that changes every call yields
+ * write-everything/read-nothing on every single request. */
+export function usesCacheControl(model: string): boolean {
+  return model.startsWith("anthropic/") || model.startsWith("google/");
 }
 
 /** True when `served` is `configured` or a versioned/variant slug of it
@@ -94,6 +111,11 @@ export interface CompletionParams {
   model?: string;
   /** Per-call reasoning effort override (adaptive routing). */
   reasoningEffort?: "off" | "low" | "medium" | "high";
+  /** Tool-choice override. "none" forces a text answer while KEEPING the tool
+   * schemas in the request — the serialized prefix stays identical to prior
+   * calls, so the prompt cache built during the run still hits. Dropping the
+   * tools array instead would change the prefix and full-miss the cache. */
+  toolChoice?: "auto" | "none";
 }
 
 /**
@@ -186,7 +208,8 @@ export class OpenRouterClient {
       models: fallbacks.length ? [primary, ...fallbacks] : undefined,
       messages: params.messages,
       tools: params.tools,
-      tool_choice: params.tools && params.tools.length ? "auto" : undefined,
+      tool_choice:
+        params.tools && params.tools.length ? params.toolChoice ?? "auto" : undefined,
       temperature: params.temperature ?? 0,
       // Omit when not capped so the provider uses the model's full output limit
       // (prevents write_file truncation on large files).
@@ -201,6 +224,15 @@ export class OpenRouterClient {
       },
       reasoning: reasoningParam(params.reasoningEffort ?? this.opts.reasoningEffort),
       zdr: this.opts.zdr ? true : undefined,
+      prompt_cache_key:
+        this.opts.promptCacheKey && primary.startsWith("openai/")
+          ? this.opts.promptCacheKey
+          : undefined,
+      // Sticky routing on ALL models. Without this, OpenRouter only pins the
+      // provider endpoint after it OBSERVES a cache hit — so a session whose
+      // hits are broken (or whose first requests bounce between e.g.
+      // OpenAI/Azure, which keep separate caches) may never converge.
+      session_id: this.opts.promptCacheKey || undefined,
     };
 
     // Failures are retried with backoff while nothing has been committed to
@@ -215,6 +247,7 @@ export class OpenRouterClient {
     // streamed text, tool calls, or usage do.
     let committed = false;
     let servedModel: string | null = null;
+    let servedProvider: string | null = null;
     this.lastGenId = null;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -313,6 +346,13 @@ export class OpenRouterClient {
           return { events, terminal: true, meaningful: true };
         }
         if (typeof json.id === "string" && json.id) this.lastGenId = json.id;
+        // Surface the upstream provider (OpenRouter includes it on stream
+        // chunks). Providers keep separate prompt caches for the same model,
+        // so per-call bouncing (e.g. OpenAI↔Azure) silently kills hit rates.
+        if (typeof json.provider === "string" && json.provider && json.provider !== servedProvider) {
+          servedProvider = json.provider;
+          events.push({ type: "provider", name: json.provider });
+        }
         // Surface which model actually served the request — ONLY when fallback
         // routing is configured and the served model is one of the fallbacks.
         // Providers report versioned slugs (e.g. "vendor/model-20260616" for
