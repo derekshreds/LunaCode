@@ -14,8 +14,6 @@ export interface LunaCodeConfig {
   maxContextTokens: number;
   autoBudgetCarryCostUsd: number;
   compactionTargetRatio: number;
-  /** Soft microcompact trigger as a fraction of the context budget (0 = off). */
-  microcompactRatio: number;
   summarizerModel: string;
   subagentModel: string;
   /** Cheap model for research/planning iterations; empty = session model. */
@@ -71,8 +69,6 @@ export function getConfig(): LunaCodeConfig {
     maxContextTokens: c.get<number>("maxContextTokens", 0),
     autoBudgetCarryCostUsd: clamp(c.get<number>("autoBudgetCarryCostUsd", 0.1), 0.01, 2, 0.1),
     compactionTargetRatio: clamp(c.get<number>("compactionTargetRatio", 0.35), 0.2, 0.8, 0.35),
-    // 0 disables; default 0.55 fires content-only stubs before hard compaction.
-    microcompactRatio: clamp(c.get<number>("microcompactRatio", 0.55), 0, 0.95, 0.55),
     summarizerModel: c.get<string>("summarizerModel", "").trim(),
     subagentModel: c.get<string>("subagentModel", "").trim(),
     plannerModel: c.get<string>("plannerModel", "").trim(),

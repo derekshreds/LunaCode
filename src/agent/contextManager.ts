@@ -19,11 +19,6 @@ export interface CompactionResult {
   deduped: number;
 }
 
-export interface MicrocompactResult {
-  tokensSaved: number;
-  stubbed: number;
-}
-
 /** Per-role / tool-result breakdown for the context inspector. */
 export interface ContextBreakdown {
   totalTokens: number;
@@ -64,10 +59,10 @@ const EDIT_TOOLS = new Set(["write_file", "edit_file", "apply_patch"]);
 /** Token headroom reserved for the checkpoint summary that replaces a span. */
 const SUMMARY_ALLOWANCE_TOKENS = 800;
 
-/** Soft microcompact: stub tool results larger than this (chars). */
-const MICRO_STUB_MIN_CHARS = 1500;
-/** Soft microcompact: leave this many chars when stubbing a large tool result. */
-const MICRO_STUB_KEEP_CHARS = 400;
+/** Compaction truncation pass: stub older tool results larger than this (chars). */
+const STUB_MIN_CHARS = 1500;
+/** Compaction truncation pass: chars kept when stubbing a large tool result. */
+const STUB_KEEP_CHARS = 400;
 
 /** Stable stringify (sorted keys) so arg order never splits identity keys.
  * Undefined-valued keys are dropped (JSON semantics): callers probing with
@@ -148,7 +143,9 @@ function isStubbedContent(content: string): boolean {
     content.startsWith("[superseded:") ||
     content.startsWith("[stale:") ||
     content.includes("[older tool output truncated") ||
-    content.startsWith("[microcompact:")
+    // Legacy marker from 0.3.0's (removed) soft-microcompact — persisted
+    // sessions may still contain these stubs.
+    content.includes("[microcompact:")
   );
 }
 
@@ -164,8 +161,14 @@ function isStubbedContent(content: string): boolean {
  * Because the static system prompt never changes and new content is only ever
  * appended, every request after the first reuses the cached prefix.
  *
- * Lossy history mutations (dedupe, path supersession, microcompact, summarize)
- * are EVENT-driven so the cache stays valid between events.
+ * INVARIANT: `messages` is append-only except inside compactIfNeeded (and
+ * user-initiated rollback). Every render() must be a prefix-extension of the
+ * previous render() between compaction events — providers with implicit
+ * caching (OpenAI et al.) match on the longest common prefix, so ANY in-place
+ * rewrite of an earlier message re-bills everything after it at the uncached
+ * rate on every subsequent call. All lossy mutations (dedupe, path
+ * supersession, truncation, summarize) are batched inside the compaction
+ * event, whose cache miss is planned and rare.
  */
 export class ContextManager {
   private systemPrompt = "";
@@ -338,27 +341,6 @@ export class ContextManager {
   }
 
   /**
-   * Soft cleanup when context is getting large but still under the hard budget.
-   * Content-only stubs (dedupe + path supersession + truncate large older tool
-   * results). Intentionally causes one cache miss so subsequent turns re-cache
-   * a smaller prefix. Returns null when under the soft threshold.
-   */
-  microcompactIfNeeded(maxTokens: number, softRatio: number): MicrocompactResult | null {
-    if (!(softRatio > 0 && softRatio < 1)) return null;
-    const soft = Math.floor(maxTokens * softRatio);
-    const before = this.estimate();
-    if (before <= soft) return null;
-
-    let stubbed = this.dedupeStaleToolResults();
-    stubbed += this.supersedeStalePathReads();
-    stubbed += this.truncateLargeOlderToolResults(MICRO_STUB_MIN_CHARS, MICRO_STUB_KEEP_CHARS);
-
-    const saved = Math.max(0, before - this.estimate());
-    if (saved === 0 && stubbed === 0) return null;
-    return { tokensSaved: saved, stubbed };
-  }
-
-  /**
    * Compact the history when it exceeds the budget.
    *
    * This is an EVENT, not a steady-state trimmer: between events the history is
@@ -377,9 +359,14 @@ export class ContextManager {
     const before = this.estimate();
     const target = Math.floor(maxTokens * opts.targetRatio);
 
-    // Pass A: supersede stale duplicate tool results + path-scoped reads.
+    // Pass A: supersede stale duplicate tool results + path-scoped reads, and
+    // truncate large tool results from turns before the current one. All
+    // content-only mutations ride this event — the cache is already being
+    // invalidated, so batching them here keeps every non-event call a pure
+    // prefix-extension (100% cache read).
     let deduped = this.dedupeStaleToolResults();
     deduped += this.supersedeStalePathReads();
+    deduped += this.truncateLargeOlderToolResults(STUB_MIN_CHARS, STUB_KEEP_CHARS);
 
     // Pass B: summarize-and-replace the oldest span down to the target floor.
     // Run it even if Pass A already got under maxTokens — stopping just under
@@ -420,29 +407,6 @@ export class ContextManager {
       summarized,
       deduped,
     };
-  }
-
-  /**
-   * Immediately stub prior path-scoped reads of the given files (content-only).
-   * Used after successful edits so the model doesn't keep re-paying for stale
-   * pre-edit contents. Only stubs results larger than `minChars`.
-   */
-  invalidateFileReads(paths: string[], minChars = 2000): number {
-    if (!paths.length) return 0;
-    const pathSet = new Set(paths.map(normalizePathKey));
-    const callMeta = this.indexToolCalls();
-    let stubbed = 0;
-    for (const m of this.messages) {
-      if (m.role !== "tool" || typeof m.content !== "string") continue;
-      if (m.content.length < minChars) continue;
-      if (isStubbedContent(m.content)) continue;
-      const meta = callMeta.get(m.tool_call_id);
-      if (!meta || !PATH_SCOPED_TOOLS.has(meta.name)) continue;
-      if (!meta.path || !pathSet.has(normalizePathKey(meta.path))) continue;
-      m.content = `[stale: ${meta.name} ${meta.path} — file was edited later; re-read if you need current contents]`;
-      stubbed++;
-    }
-    return stubbed;
   }
 
   /** Breakdown of what's in the context window (for the inspector UI). */
@@ -627,6 +591,7 @@ export class ContextManager {
   /**
    * Truncate large tool results that sit before the last user message (older
    * than the active task). Content-only; keeps a short head for orientation.
+   * Only called from inside the compaction event (the planned cache miss).
    */
   private truncateLargeOlderToolResults(minChars: number, keepChars: number): number {
     const lastUser = this.lastUserIndex();
@@ -639,7 +604,7 @@ export class ContextManager {
       if (isStubbedContent(m.content)) continue;
       m.content =
         m.content.slice(0, keepChars) +
-        `\n…[microcompact: older tool output truncated (${m.content.length} → ${keepChars} chars)]`;
+        `\n…[older tool output truncated (${m.content.length} → ${keepChars} chars) to save context]`;
       stubbed++;
     }
     return stubbed;
@@ -794,17 +759,26 @@ export class ContextManager {
     return -1;
   }
 
-  /** Build the final messages array for an API request, with cache breakpoints. */
-  render(): ChatMessage[] {
+  /** Build the final messages array for an API request, with cache breakpoints.
+   *
+   * `volatileTail: false` omits the ephemeral tail. Required for implicit
+   * exact-prefix caching providers (OpenAI et al.): "past the breakpoints" is
+   * an Anthropic concept — implicit providers cache the FULL prompt, so a
+   * trailing message that changes every call makes every cached entry end in
+   * bytes the next request never reproduces (100% write, 0% read). */
+  render(opts?: { volatileTail?: boolean }): ChatMessage[] {
     const out: ChatMessage[] = [];
     out.push(this.renderSystem());
     const bps = this.cachingEnabled ? this.breakpointIndices() : new Set<number>();
     for (let i = 0; i < this.messages.length; i++) {
       out.push(bps.has(i) ? withCacheControl(this.messages[i]) : this.messages[i]);
     }
-    // Volatile tail goes last, past every breakpoint — cache-free by position.
-    const tail = this.renderTail();
-    if (tail) out.push(tail);
+    // Volatile tail goes last, past every breakpoint — cache-free by position
+    // (on cache_control providers only; see doc comment).
+    if (opts?.volatileTail !== false) {
+      const tail = this.renderTail();
+      if (tail) out.push(tail);
+    }
     return out;
   }
 

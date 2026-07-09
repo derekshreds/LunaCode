@@ -9,7 +9,7 @@ import { ContextManager } from "../agent/contextManager";
 import { collapseRestoreSet } from "../agent/checkpoints";
 import { computeDiff, reconstructWithReverts } from "../diff";
 import { buildSystemPrompt } from "../agent/systemPrompt";
-import { OpenRouterClient } from "../openrouter/client";
+import { OpenRouterClient, usesCacheControl } from "../openrouter/client";
 import { getConfig, SecretStore } from "../config";
 import { AgentMode, MODES } from "../modes";
 import { ApprovalDecision, ApprovalRequest } from "../agent/tools/types";
@@ -87,6 +87,10 @@ export class LunaCodeController {
     stamps: Array<{ path: string; mtimeMs: number }>;
     result: string | undefined;
   } | null = null;
+  /** Per-model render digests for the cache-prefix diagnostics (agent.ts).
+   * Session-lived (the Agent is rebuilt every turn) so CROSS-turn prefix
+   * divergence — the expensive kind — is caught too. */
+  private cacheDigests = new Map<string, string[]>();
   /** User messages waiting to run (queued while a turn is active). `echoId` ties
    * a queued message back to its transcript bubble so the rewind button can be
    * attached to it once the turn actually starts. */
@@ -106,6 +110,10 @@ export class LunaCodeController {
     cachedTokens: 0,
     cost: 0,
   };
+  /** Per-session OpenAI cache-routing key (prompt_cache_key). Stable across
+   * every call of a session — main loop, planner, sub-agents, prewarm — and
+   * rotated on new/restored sessions (their cache is cold regardless). */
+  private promptCacheKey = newPromptCacheKey();
   private activeModel = "";
   /** Model metadata (context window + prompt price) for auto context budgets. */
   private modelMeta = new Map<string, { contextLength?: number; promptPrice?: number }>();
@@ -250,6 +258,8 @@ export class LunaCodeController {
     this.sessionMcpTools = null; // pick up newly-connected MCP servers
     this.sessionToolPhase = "read";
     this.stickyMemory = emptyStickyMemory();
+    this.cacheDigests.clear();
+    this.promptCacheKey = newPromptCacheKey();
     // New session = new cache prefix anyway; re-read the volatile prompt inputs.
     this.repoMapCache = null;
     this.overviewCache = null;
@@ -478,7 +488,6 @@ export class LunaCodeController {
         maxContextTokens: cfg.maxContextTokens,
         autoBudgetCarryCostUsd: cfg.autoBudgetCarryCostUsd,
         compactionTargetRatio: cfg.compactionTargetRatio,
-        microcompactRatio: cfg.microcompactRatio,
         maxTokens: cfg.maxTokens,
         temperature: cfg.temperature,
         enablePromptCaching: cfg.enablePromptCaching,
@@ -529,7 +538,6 @@ export class LunaCodeController {
     "maxContextTokens",
     "autoBudgetCarryCostUsd",
     "compactionTargetRatio",
-    "microcompactRatio",
     "maxTokens",
     "temperature",
     "enablePromptCaching",
@@ -604,6 +612,7 @@ export class LunaCodeController {
     this.currentCreatedAt = s.createdAt;
     this.mode = s.mode;
     this.sessionMcpTools = null;
+    this.cacheDigests.clear();
     // A resumed session starts from a cold provider cache regardless, so begin
     // at the full tool set — a later mid-session unlock would cost a full
     // cache miss at a much larger context.
@@ -635,6 +644,7 @@ export class LunaCodeController {
       cachedTokens: 0,
       cost: 0,
     };
+    this.promptCacheKey = newPromptCacheKey();
     this.post({ type: "sessionReset" });
     await this.sendConfig();
     // Restore sticky memory from the persisted session, falling back to empty.
@@ -1016,6 +1026,7 @@ export class LunaCodeController {
       providerSort: cfg.providerSort,
       quantizations: cfg.quantizations,
       reasoningEffort: cfg.reasoningEffort === "default" ? undefined : cfg.reasoningEffort,
+      promptCacheKey: this.promptCacheKey,
     });
 
     // Prompt build and budget calc are independent — overlap them (the budget
@@ -1036,9 +1047,12 @@ export class LunaCodeController {
         maxContextTokens,
         summarizerModel: cfg.summarizerModel || cfg.model,
         compactionTargetRatio: cfg.compactionTargetRatio,
-        microcompactRatio: cfg.microcompactRatio,
         subagentModel: cfg.subagentModel,
-        plannerModel: cfg.plannerModel || cfg.subagentModel,
+        // Planner routing is opt-in via plannerModel ONLY. Never fall back to
+        // subagentModel here: that setting scopes sub-agents, and silently
+        // swapping the MAIN loop's model per iteration cold-starts the primary
+        // model's prompt cache on every swap (caches are per-model).
+        plannerModel: cfg.plannerModel,
         implementerModel: cfg.implementerModel,
         subagentMaxContextTokens: cfg.subagentMaxContextTokens,
         progressiveTools: cfg.progressiveTools,
@@ -1057,6 +1071,7 @@ export class LunaCodeController {
         takeSteering: () => this.queue.splice(0, this.queue.length),
         formatAfterEdit: cfg.formatAfterEdit,
         stickyMemory: this.stickyMemory,
+        cacheDigests: this.cacheDigests,
         // Called at compaction — a planned cache miss — so refreshing the
         // volatile prompt inputs (repo map, project memory) there is free.
         refreshSystemPrompt: () => applyPrompt({ refreshVolatile: true }),
@@ -1858,6 +1873,11 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
   private async maybePrewarm() {
     const cfg = getConfig();
     if (!cfg.prewarmCache || !cfg.enablePromptCaching) return;
+    // Only meaningful on cache_control providers. Implicit exact-prefix caches
+    // (OpenAI GPT-5.6+) key the automatic cache entry at the LATEST message —
+    // here the synthetic "Reply with exactly: ok" — which the real first turn
+    // never reproduces, so the prewarm is a pure billed-write with no read.
+    if (!usesCacheControl(cfg.model)) return;
     const root = this.workspaceRoot();
     const apiKey = await this.secrets.getApiKey();
     if (!root || !apiKey) return;
@@ -1871,12 +1891,15 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
     const client = new OpenRouterClient({
       apiKey,
       baseUrl: cfg.baseUrl,
+      // Always the true primary: main-loop calls never swap models unless the
+      // user explicitly sets plannerModel, so this prefix is the one that pays.
       model: cfg.model,
       dataCollection: cfg.dataCollection,
       zdr: cfg.zeroDataRetention,
       providerSort: cfg.providerSort,
       quantizations: cfg.quantizations,
       reasoningEffort: cfg.reasoningEffort === "default" ? undefined : cfg.reasoningEffort,
+      promptCacheKey: this.promptCacheKey,
     });
     const allowsMutation = MODES[this.mode].allowsMutation;
     // Mirror the first real call's tool set exactly — with progressive tools
@@ -2132,14 +2155,6 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
         };
         this.post({ type: "sessionUsage", usage: this.sessionUsage });
         break;
-      case "microcompact":
-        // Count toward tokensSaved so the meter reflects soft cleanups too.
-        this.sessionUsage = {
-          ...this.sessionUsage,
-          tokensSaved: (this.sessionUsage.tokensSaved ?? 0) + e.tokensSaved,
-        };
-        this.post({ type: "sessionUsage", usage: this.sessionUsage });
-        break;
       case "error":
         this.post({ type: "error", message: e.message });
         break;
@@ -2305,6 +2320,11 @@ function messagesToEvents(
     }
   }
   return events;
+}
+
+/** Fresh session key for OpenAI prompt-cache routing (prompt_cache_key). */
+function newPromptCacheKey(): string {
+  return `lunacode-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function getNonce(): string {

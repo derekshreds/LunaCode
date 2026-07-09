@@ -136,14 +136,16 @@ export async function runSubagent(question: string, opts: SubagentOptions): Prom
 
     // Chars this request sends — paired with the usage frame to calibrate the
     // sub-context's token estimator (its 60k budget check).
-    const sentChars =
-      context.renderChars() +
-      (finalRound ? 0 : JSON.stringify(toolDefs).length);
+    const sentChars = context.renderChars() + JSON.stringify(toolDefs).length;
 
+    // Final round: force a text answer via tool_choice "none" while keeping
+    // the tool schemas in the request — dropping them would change the
+    // serialized prefix and full-miss the cache built during the run.
     for await (const ev of opts.client.stream({
       model: opts.model,
       messages: context.render(),
-      tools: finalRound ? undefined : toolDefs,
+      tools: toolDefs,
+      toolChoice: finalRound ? "none" : "auto",
       temperature: 0,
       signal: opts.signal,
     })) {

@@ -84,6 +84,16 @@ export interface ChatCompletionRequest {
   reasoning?: Record<string, unknown>;
   // Per-request Zero Data Retention enforcement.
   zdr?: boolean;
+  // OpenAI cache-routing key (passed through by OpenRouter). OpenAI's automatic
+  // prompt caching routes requests by a hash of the prompt's first ~256 tokens
+  // plus this key; newer models (GPT-5.6+) need it for reliable prefix matching.
+  prompt_cache_key?: string;
+  // OpenRouter sticky-routing key. Without it, sticky routing (same provider
+  // endpoint across a conversation, which keeps the provider's prompt cache
+  // warm) only activates AFTER a cache hit is observed — a chicken-and-egg
+  // problem when hits are what's broken. With it, stickiness starts on the
+  // first successful request.
+  session_id?: string;
 }
 
 export interface Usage {
@@ -92,7 +102,12 @@ export interface Usage {
   total_tokens: number;
   // OpenRouter / Anthropic cache accounting (present when available).
   prompt_tokens_details?: {
+    /** Tokens read from the provider's prompt cache (the discount). */
     cached_tokens?: number;
+    /** Tokens written to the provider's prompt cache (billed at >1x on
+     * Anthropic and OpenAI GPT-5.6+). write>0 with read=0 call after call
+     * means the prefix never matches — each request re-caches from scratch. */
+    cache_write_tokens?: number;
   };
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
@@ -102,6 +117,10 @@ export interface Usage {
 // Discriminated events emitted by the streaming client.
 export type StreamEvent =
   | { type: "model"; id: string } // served by a fallback model
+  // Upstream provider serving this request (e.g. "OpenAI" vs "Azure"). Provider
+  // prompt caches are separate, so per-call provider bouncing shows up as a
+  // cache-hit-rate collapse — surfacing it makes that diagnosable.
+  | { type: "provider"; name: string }
   | { type: "text"; delta: string }
   | { type: "reasoning"; delta: string }
   | { type: "tool_call_start"; index: number; id: string; name: string }
