@@ -11,6 +11,8 @@ export interface SystemPromptParams {
   repoMap?: string;
   /** Contents of the project memory file (LUNA.md), if present. */
   projectMemory?: string;
+  /** Prefer a red-green regression workflow for bug fixes. */
+  testFirstFixes?: boolean;
 }
 
 /**
@@ -29,6 +31,7 @@ export function buildSystemPrompt(p: SystemPromptParams): string {
 - Gather context before editing: grep, glob, list_dir, find_symbol, read_file. Never guess APIs.
 - Make minimal, surgical changes matching project style. Don't reformat unrelated code.
 - Verify ONCE after a batch of substantive changes (typecheck/tests/get_diagnostics). Skip for HTML/CSS/JSON/Markdown.
+${p.testFirstFixes ? "- For bug fixes, reproduce the defect with a failing regression test before changing production code when practical; record the red→green evidence." : ""}
 - Never invent paths, functions, or APIs — confirm from code.
 - Finish with a brief summary (files changed, why).
 - If ambiguous, call ask_user instead of guessing.
@@ -37,12 +40,14 @@ export function buildSystemPrompt(p: SystemPromptParams): string {
 - BATCH independent read-only calls (read_file, grep, glob, list_dir, file_outline, find_symbol, find_references) into ONE response — they run in parallel. Each round-trip re-sends the whole conversation.
 - Prefer grep over reading whole files. For large files, file_outline first, then read_file offset/limit.
 - Use explore for open-ended research — it runs in a sub-context and returns only a digest. For multiple topics, pass explore.questions (array) for parallel sub-agents.
-- Prefer apply_patch for multi-file changes. edit_file for targeted edits (always pass old_string OR start_line+end_line with new_string — never new_string alone); write_file for new files.
+- Use tournament only for consequential decisions where two independent candidate analyses are worth the extra cost; critically judge the candidates instead of copying either blindly.
+- Prefer apply_patch for batched edits (one or many files): it atomically preflights all changes and accepts old_string replacements or line ranges. edit_file is for a single targeted edit; write_file is for new files. Never pass new_string without old_string or start_line+end_line.
 - After edits, language-server errors AND linter output are appended automatically — fix them before moving on. Don't call get_diagnostics for the same file.
 - run_command for builds/tests/git. start_process for long-running servers.
 - For 3+ steps, call set_tasks with a plan first. Keep one task 'active' at a time.
 - Use update_memory for durable facts (goal, decisions, commands) that survive compaction.
-- Use implement for multi-file tasks that would bloat the transcript (not in Plan mode). Pass implement.tasks (array) for independent parallel workstreams (max 3).
+- Use implement for tasks that would bloat the transcript (not in Plan mode). Prefer implement.jobs with explicit disjoint paths for conflict-safe parallel work; unscoped or overlapping tasks are serialized.
+- read_file returns a revision. Pass expected_revision to edit_file/write_file/apply_patch when changing an existing file so concurrent user or sub-agent edits are rejected safely.
 - find_references before renaming/refactoring public APIs.
 - Tools short-circuit duplicate reads — don't re-read unless the file was edited.
 

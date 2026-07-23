@@ -161,6 +161,8 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("lunacode.mergeSandbox", () => controller.mergeSandbox()),
     vscode.commands.registerCommand("lunacode.discardSandbox", () => controller.discardSandbox()),
     vscode.commands.registerCommand("lunacode.exportSession", () => controller.exportSession()),
+    vscode.commands.registerCommand("lunacode.exportBenchmark", () => controller.exportBenchmarkMetrics()),
+    vscode.commands.registerCommand("lunacode.openControlCenter", () => controller.openControlCenter()),
     vscode.commands.registerCommand("lunacode.selectWorkspaceFolder", () =>
       controller.pickWorkspaceFolder()
     ),
@@ -229,6 +231,7 @@ async function pickSubagentModel(secrets: SecretStore, controller: LunaCodeContr
     title: "Select Subagent Model",
     current,
     allowClear: true,
+    preferCheap: true,
   });
   if (modelId === undefined) return; // cancelled
   await setSubagentModel(modelId);
@@ -243,7 +246,7 @@ async function pickSubagentModel(secrets: SecretStore, controller: LunaCodeContr
 
 async function pickOpenRouterModel(
   secrets: SecretStore,
-  opts: { title: string; current: string; allowClear?: boolean }
+  opts: { title: string; current: string; allowClear?: boolean; preferCheap?: boolean }
 ): Promise<string | undefined> {
   const cfg = getConfig();
   const apiKey = await secrets.getApiKey();
@@ -281,28 +284,39 @@ async function pickOpenRouterModel(
       vscode.window.showWarningMessage("Set your API key first to browse models.");
       return undefined;
     }
-    modelId = await browseAllModels(apiKey, cfg.baseUrl);
+    modelId = await browseAllModels(apiKey, cfg.baseUrl, !!opts.preferCheap);
     if (!modelId) return undefined;
   }
   return modelId;
 }
 
-async function browseAllModels(apiKey: string, baseUrl: string): Promise<string> {
+async function browseAllModels(apiKey: string, baseUrl: string, preferCheap = false): Promise<string> {
   try {
     const client = new OpenRouterClient({ apiKey, baseUrl, model: "" });
     const models = await client.listModels();
+    const price = (m: (typeof models)[number]) => {
+      const prompt = Number.parseFloat(m.pricing?.prompt ?? "");
+      const completion = Number.parseFloat(m.pricing?.completion ?? "");
+      return (Number.isFinite(prompt) ? prompt : Number.POSITIVE_INFINITY) +
+        (Number.isFinite(completion) ? completion : Number.POSITIVE_INFINITY);
+    };
     const items: vscode.QuickPickItem[] = models
-      .sort((a, b) => a.id.localeCompare(b.id))
+      .sort((a, b) => preferCheap ? price(a) - price(b) || a.id.localeCompare(b.id) : a.id.localeCompare(b.id))
       .map((m) => ({
         label: m.id,
-        description: m.contextLength ? `${Math.round(m.contextLength / 1000)}k ctx` : undefined,
+        description: [
+          Number.isFinite(Number.parseFloat(m.pricing?.prompt ?? ""))
+            ? `$${(Number.parseFloat(m.pricing.prompt) * 1_000_000).toFixed(2)}/M in`
+            : "",
+          m.contextLength ? `${Math.round(m.contextLength / 1000)}k ctx` : "",
+        ].filter(Boolean).join(" · ") || undefined,
         detail: m.name,
       }));
     const pick = await vscode.window.showQuickPick(items, {
       title: "All OpenRouter Models",
       matchOnDescription: true,
       matchOnDetail: true,
-      placeHolder: "Type to filter…",
+      placeHolder: preferCheap ? "Cheapest models first — type to filter…" : "Type to filter…",
     });
     return pick?.label ?? "";
   } catch (e: any) {

@@ -2,7 +2,8 @@ import * as vscode from "vscode";
 import { OpenRouterClient } from "../openrouter/client";
 import { ToolCall, Usage } from "../openrouter/types";
 import { ContextManager } from "./contextManager";
-import { Tool, ToolContext } from "./tools/types";
+import { SubagentRunResult, Tool, ToolContext } from "./tools/types";
+import type { ToolReport } from "../webview/protocol";
 import { toToolDefinitions } from "./tools";
 import { truncate } from "./tools/util";
 
@@ -32,11 +33,11 @@ Rules:
 ${extra ? `\n${extra}` : ""}`;
 }
 
-const DEFAULT_MAX_SUBAGENT_ITERATIONS = 10;
+const DEFAULT_MAX_SUBAGENT_ITERATIONS = 8;
 /** Force a final answer if the sub-context grows past this (rough tokens). */
-const DEFAULT_MAX_SUBAGENT_CONTEXT_TOKENS = 60_000;
+const DEFAULT_MAX_SUBAGENT_CONTEXT_TOKENS = 32_000;
 /** Cap individual tool results inside the sub-agent (digest quality > dumps). */
-const MAX_SUBAGENT_TOOL_RESULT_CHARS = 12_000;
+const MAX_SUBAGENT_TOOL_RESULT_CHARS = 8_000;
 
 export interface SubagentOptions {
   client: OpenRouterClient;
@@ -53,13 +54,16 @@ export interface SubagentOptions {
   maxIterations?: number;
   /** Override sub-context token budget (default 60k). */
   maxContextTokens?: number;
+  /** Enforced workspace-relative write paths for implementer sub-agents. */
+  writeScope?: string[];
   output: vscode.OutputChannel;
   signal: AbortSignal;
   onStatus?: (message: string) => void;
   onUsage?: (usage: Usage) => void;
 }
 
-export async function runSubagent(question: string, opts: SubagentOptions): Promise<string> {
+export async function runSubagent(question: string, opts: SubagentOptions): Promise<SubagentRunResult> {
+  const startedAt = Date.now();
   const context = new ContextManager(true);
   context.setSystemPrompt(
     buildSubagentPrompt(opts.workspaceRoot, opts.workspaceOverview, opts.systemPromptExtra)
@@ -71,21 +75,74 @@ export async function runSubagent(question: string, opts: SubagentOptions): Prom
   const maxIter = opts.maxIterations ?? DEFAULT_MAX_SUBAGENT_ITERATIONS;
   const maxContextTokens = opts.maxContextTokens ?? DEFAULT_MAX_SUBAGENT_CONTEXT_TOKENS;
   const allowsMutation = opts.tools.some((t) => t.mutating);
+  const toolCounts = new Map<string, number>();
+  const sources = new Set<string>();
+  let iterations = 0;
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let cachedTokens = 0;
+  let cost = 0;
+
+  const noteCall = (call: ToolCall, args: any) => {
+    const name = call.function.name;
+    toolCounts.set(name, (toolCounts.get(name) ?? 0) + 1);
+    if (typeof args?.path === "string" && args.path && args.path !== ".") {
+      sources.add(args.path);
+    }
+    if (Array.isArray(args?.changes)) {
+      for (const change of args.changes) {
+        if (typeof change?.path === "string") sources.add(change.path);
+      }
+    }
+  };
+
+  const noteResultSources = (toolName: string, content: string) => {
+    if (toolName !== "grep" && toolName !== "find_symbol" && toolName !== "find_references") return;
+    for (const line of content.split("\n")) {
+      const match = /^\s*([^:\n]+\.[A-Za-z0-9_-]+):(\d+)(?::\d+)?[: ]/.exec(line);
+      if (match) sources.add(match[1].trim());
+      if (sources.size >= 20) break;
+    }
+  };
+
+  const finish = (summary: string, successful = true): SubagentRunResult => {
+    const report: ToolReport = {
+      kind: allowsMutation ? "implementation" : "research",
+      task: question.slice(0, 2000),
+      agents: 1,
+      successful: successful ? 1 : 0,
+      iterations,
+      toolCalls: [...toolCounts.values()].reduce((sum, n) => sum + n, 0),
+      durationMs: Date.now() - startedAt,
+      promptTokens,
+      completionTokens,
+      cachedTokens,
+      ...(cost > 0 ? { cost } : {}),
+      tools: [...toolCounts.entries()]
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
+      sources: [...sources].slice(0, 20),
+    };
+    return { summary, report };
+  };
 
   const ctx: ToolContext = {
     workspaceRoot: opts.workspaceRoot,
     mode: allowsMutation ? "auto" : "plan",
+    delegated: true,
     signal: opts.signal,
     output: opts.output,
     log: () => {}, // sub-agent progress stays out of the main chat
     // Tools here either are read-only or run under Auto-like trust for implementer.
     requestApproval: async () => "approved",
     context,
+    writeScope: opts.writeScope,
   };
 
   let lastText = "";
   for (let iter = 0; iter < maxIter; iter++) {
     if (opts.signal.aborted) break;
+    iterations++;
 
     // Out of iteration/context budget → one final call with NO tools so the
     // model must answer from what it has gathered.
@@ -106,8 +163,10 @@ export async function runSubagent(question: string, opts: SubagentOptions): Prom
       } catch {
         return `Invalid JSON arguments for ${call.function.name}.`;
       }
+      noteCall(call, args);
       try {
         const result = await t.execute(args, ctx);
+        noteResultSources(call.function.name, result.content);
         const { text } = truncate(result.content, MAX_SUBAGENT_TOOL_RESULT_CHARS);
         return text;
       } catch (e: any) {
@@ -178,6 +237,13 @@ export async function runSubagent(question: string, opts: SubagentOptions): Prom
         }
         case "usage":
           context.noteObservedUsage(sentChars, ev.usage.prompt_tokens);
+          promptTokens += ev.usage.prompt_tokens;
+          completionTokens += ev.usage.completion_tokens;
+          cachedTokens +=
+            ev.usage.prompt_tokens_details?.cached_tokens ??
+            ev.usage.cache_read_input_tokens ??
+            0;
+          cost += ev.usage.cost ?? 0;
           opts.onUsage?.(ev.usage);
           break;
         case "error":
@@ -192,7 +258,7 @@ export async function runSubagent(question: string, opts: SubagentOptions): Prom
     }
 
     if (errored) {
-      return lastText || `Sub-agent failed: ${errored}`;
+      return finish(lastText || `Sub-agent failed: ${errored}`, false);
     }
     if (textBuf.trim()) lastText = textBuf.trim();
 
@@ -244,5 +310,5 @@ export async function runSubagent(question: string, opts: SubagentOptions): Prom
     }
   }
 
-  return lastText || "The sub-agent did not produce an answer.";
+  return finish(lastText || "The sub-agent did not produce an answer.", !!lastText);
 }

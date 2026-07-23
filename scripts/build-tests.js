@@ -22,6 +22,13 @@ async function main() {
       alias: { vscode: "./scripts/vscode-stub.ts" },
     }),
     esbuild.build({
+      entryPoints: ["scripts/test-openrouter.ts"],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: "dist/test-openrouter.js",
+    }),
+    esbuild.build({
       entryPoints: ["scripts/test-checkpoints.ts"],
       bundle: true,
       platform: "node",
@@ -34,6 +41,37 @@ async function main() {
       platform: "node",
       format: "cjs",
       outfile: "dist/test-loop-guard.js",
+    }),
+    esbuild.build({
+      entryPoints: ["scripts/test-write-tools.ts"],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: "dist/test-write-tools.js",
+      alias: { vscode: "./scripts/vscode-stub.ts" },
+    }),
+    esbuild.build({
+      entryPoints: ["scripts/test-coordination.ts"],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: "dist/test-coordination.js",
+    }),
+    esbuild.build({
+      entryPoints: ["scripts/test-subagent.ts"],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: "dist/test-subagent.js",
+      alias: { vscode: "./scripts/vscode-stub.ts" },
+    }),
+    esbuild.build({
+      entryPoints: ["scripts/test-control-center.ts"],
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      outfile: "dist/test-control-center.js",
+      alias: { vscode: "./scripts/vscode-stub.ts" },
     }),
   ]);
 }

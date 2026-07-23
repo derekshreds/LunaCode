@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import { ChatMessage } from "./openrouter/types";
 import { AgentMode } from "./modes";
-import { SessionUsage } from "./webview/protocol";
+import { SessionUsage, TurnReceipt } from "./webview/protocol";
+import type { AuditEntry, DurableQueueItem, RecoveryRun } from "./controlCenter";
 
 export interface SessionMeta {
   id: string;
@@ -33,6 +34,13 @@ export interface StoredSession extends SessionMeta {
     nextStep?: string;
     commands: Record<string, string>;
   };
+  /** Durable, UI-facing evidence for completed turns. */
+  receipts?: TurnReceipt[];
+  /** Crash-safe control-plane state. Old sessions omit these fields. */
+  pendingQueue?: DurableQueueItem[];
+  activeRun?: RecoveryRun;
+  queuePaused?: boolean;
+  audit?: AuditEntry[];
 }
 
 const INDEX_KEY = "lunacode.sessions.index";

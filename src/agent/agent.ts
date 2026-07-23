@@ -25,8 +25,10 @@ import {
 import { formatFile, postEditDiagnostics, postEditLint } from "./tools/vscodeTools";
 import { IGNORED_DIRS, readCacheInvalidatePath, truncateHeadTail } from "./tools/util";
 import { runSubagent } from "./subagent";
+import { combineSubagentReports, estimateToolSchemaTokens } from "./delegation";
 import { LoopGuard } from "./loopGuard";
-import { AgentMode, MODES } from "../modes";
+import { canUseIsolatedWorktree, runInIsolatedWorktree } from "./isolatedWorktree";
+import { AgentMode, MODES, useProgressiveTools } from "../modes";
 import {
   StickyMemory,
   applyStickyUpdate,
@@ -48,6 +50,7 @@ const IMPLEMENT_SIGNAL = new Set([
   "apply_patch",
   "run_command",
   "implement",
+  "tournament",
   "start_process",
 ]);
 
@@ -79,7 +82,7 @@ export type AgentEvent =
   | { type: "text"; delta: string }
   | { type: "reasoning"; delta: string }
   | { type: "tool_start"; id: string; name: string; args: any }
-  | { type: "tool_end"; id: string; name: string; ok: boolean; summary: string; diff?: import("../webview/protocol").DiffData }
+  | { type: "tool_end"; id: string; name: string; ok: boolean; summary: string; diff?: import("../webview/protocol").DiffData; diffs?: import("../webview/protocol").DiffData[]; report?: import("../webview/protocol").ToolReport; evidence?: string[] }
   | { type: "status"; message: string }
   /** Queued messages were drained into the running turn as steering. */
   | { type: "steering" }
@@ -91,6 +94,7 @@ export type AgentEvent =
       model?: string;
     }
   | { type: "compaction"; tokensSaved: number; summarized: boolean; deduped: number }
+  | { type: "tool_schema"; tools: number; estimatedTokens: number }
   | { type: "tasks"; tasks: TaskItem[] }
   /** Live generation progress (throttled) — includes tool-call argument
    * streaming, which otherwise produces no visible output. */
@@ -175,6 +179,11 @@ export interface AgentDeps {
    * Must outlive the Agent (rebuilt every turn) so cross-turn prefix
    * divergence — the expensive kind — is detected too. */
   cacheDigests?: Map<string, string[]>;
+  estimateDelegation?: ToolContext["estimateDelegation"];
+  /** Two distinct model routes used for independent candidate analysis. */
+  tournamentModels?: string[];
+  /** Run implementer sub-agents in disposable Git worktrees, then merge their patches. */
+  isolateImplementers?: boolean;
 }
 
 const DEFAULT_MAX_TURNS = 200;
@@ -242,6 +251,9 @@ export class Agent {
   private overviewCache: string | undefined | null = null;
   /** Paths edited since last successful verify. */
   private dirtySinceVerify = new Set<string>();
+  /** Edited paths waiting for the last edit in a model-emitted batch to run
+   * diagnostics once, instead of paying the language-server debounce per file. */
+  private pendingValidationPaths = new Set<string>();
   /** Last status message this turn — skip consecutive identical ones. */
   private lastStatus = "";
   /** Fallback digest store when the controller doesn't supply a session-lived
@@ -391,10 +403,9 @@ export class Agent {
     this.cb.onEvent({ type: "turn_start" });
 
     const allowsMutation = MODES[mode].allowsMutation;
-    // Plan mode always gets the full read set; progressive only applies when
-    // mutations are allowed and the setting is on.
-    const progressive =
-      !!this.deps.progressiveTools && allowsMutation && mode !== "plan";
+    // Plan gets the full read set and Auto gets the full write-capable set;
+    // only Standard may progressively unlock edit/exec schemas.
+    const progressive = useProgressiveTools(mode, !!this.deps.progressiveTools);
     if (!progressive) this.toolPhase = "all";
 
     const rebuildTools = () => {
@@ -410,6 +421,7 @@ export class Agent {
       return toToolDefinitions(tools);
     };
     let toolDefs = rebuildTools();
+    this.cb.onEvent({ type: "tool_schema", tools: toolDefs.length, estimatedTokens: estimateToolSchemaTokens(toolDefs) });
 
     // 0 = unlimited; undefined falls back to the default cap.
     const configuredMaxTurns = this.deps.maxTurns ?? DEFAULT_MAX_TURNS;
@@ -436,6 +448,7 @@ export class Agent {
           this.toolPhase = "all";
           this.deps.onToolPhaseChange?.("all");
           toolDefs = rebuildTools();
+          this.cb.onEvent({ type: "tool_schema", tools: toolDefs.length, estimatedTokens: estimateToolSchemaTokens(toolDefs) });
           this.emitStatus("Unlocked full tool set for this session.");
         }
 
@@ -774,6 +787,11 @@ export class Agent {
           const d = loop.decisions[bi];
           if (d?.blocked) blocked.set(bi, d.reason);
         }
+        const lastEditCall = [...entries]
+          .map(([, call], index) => ({ call, index }))
+          .reverse()
+          .find(({ call, index }) => EDIT_TOOLS.has(call.function.name) && !blocked.has(index))
+          ?.call;
         if (loop.hardStop) {
           for (let bi = 0; bi < entries.length; bi++) {
             const [idx, call] = entries[bi];
@@ -863,7 +881,13 @@ export class Agent {
             }
             i = j;
           } else {
-            const result = await this.runToolCall(call, mode, signal, truncated);
+            const result = await this.runToolCall(
+              call,
+              mode,
+              signal,
+              truncated,
+              EDIT_TOOLS.has(call.function.name) && call !== lastEditCall,
+            );
             this.deps.context.addToolResult(call.id, result);
             i++;
           }
@@ -886,7 +910,8 @@ export class Agent {
     call: ToolCall,
     mode: AgentMode,
     signal: AbortSignal,
-    truncated = false
+    truncated = false,
+    deferValidation = false,
   ): Promise<string> {
     const tool = this.toolMap.get(call.function.name);
     let args: any = {};
@@ -951,11 +976,12 @@ export class Agent {
       context: this.deps.context,
       stickyMemory: this.deps.stickyMemory,
       verifyCache: this.verifyCache,
+      estimateDelegation: this.deps.estimateDelegation,
       requestApproval: async (req) => {
-        // Auto mode is fully autonomous: it runs edits AND commands without
-        // prompting. (Always-deny commands are still hard-blocked inside
-        // run_command, and Plan mode never reaches a mutating tool at all.)
-        if (mode === "auto") {
+        // Auto mode runs routine edits/commands without prompting. Sensitive
+        // file reads remain explicitly user-gated; always-deny commands are
+        // still hard-blocked inside run_command.
+        if (mode === "auto" && req.kind !== "secret-read") {
           return "approved";
         }
         // The provider owns session-level "approve always" memory and maps
@@ -988,24 +1014,53 @@ export class Agent {
               model: this.deps.subagentModel || this.deps.plannerModel || undefined,
             }),
         }),
+      tournament: async (question) => {
+        const models = [...new Set((this.deps.tournamentModels ?? []).filter(Boolean))].slice(0, 2);
+        while (models.length < 2) models.push(this.deps.subagentModel || this.deps.plannerModel || "");
+        const candidates = await Promise.all(models.map((model, i) =>
+          runSubagent(question, {
+            client: this.deps.client,
+            model: model || undefined,
+            tools: toolsForSubagent(),
+            workspaceRoot: this.deps.workspaceRoot,
+            workspaceOverview: this.getOverview(),
+            output: this.deps.output,
+            signal,
+            maxContextTokens: this.deps.subagentMaxContextTokens,
+            systemPromptExtra: `You are candidate ${i + 1} in an independent model tournament. Produce a concrete answer with assumptions, risks, and evidence. Do not defer to another candidate.`,
+            onStatus: (m) => this.cb.onEvent({ type: "tool_output", id: call.id, delta: `[Candidate ${i + 1}] ${m}\n` }),
+            onUsage: (usage) => this.cb.onEvent({
+              type: "usage",
+              usage,
+              cachedTokens: usage.prompt_tokens_details?.cached_tokens ?? usage.cache_read_input_tokens ?? 0,
+              model: model || undefined,
+            }),
+          })
+        ));
+        return {
+          summary: candidates.map((c, i) => `## Candidate ${i + 1} (${models[i] || "session route"})\n\n${c.summary}`).join("\n\n---\n\n") + "\n\nJudge these candidates against the user's goal. Select or synthesize the best answer and state the decisive tradeoff.",
+          report: combineSubagentReports("research", candidates),
+        };
+      },
       implement:
         allowsMutationFor(mode)
-          ? (task) =>
-              runSubagent(task, {
+          ? async (request) => {
+              const run = (workspaceRoot: string) => runSubagent(request.task, {
                 client: this.deps.client,
                 model:
                   this.deps.implementerModel ||
                   this.deps.subagentModel ||
                   undefined,
                 tools: toolsForImplementer(),
-                workspaceRoot: this.deps.workspaceRoot,
+                workspaceRoot,
                 workspaceOverview: this.getOverview(),
                 output: this.deps.output,
                 signal,
                 maxContextTokens: this.deps.subagentMaxContextTokens,
+                writeScope: request.paths,
                 // Write-capable: use a tighter iteration budget via prompt.
                 systemPromptExtra:
-                  "You MAY edit files and run safe commands to complete the task. Prefer apply_patch/edit_file. When done, reply with a concise summary: files changed, what you did, and any remaining risks. Do not ask questions.",
+                  `You MAY edit files and run safe commands to complete the task. ${request.paths?.length ? `You MUST only write within these declared paths: ${request.paths.join(", ")}. ` : ""}Prefer apply_patch/edit_file and include expected_revision from read_file. When done, reply with a concise summary: files changed, what you did, tests, and remaining risks. Do not ask questions.`,
                 maxIterations: 16,
                 onStatus: (m) =>
                   this.cb.onEvent({ type: "tool_output", id: call.id, delta: m + "\n" }),
@@ -1022,7 +1077,25 @@ export class Agent {
                       this.deps.subagentModel ||
                       undefined,
                   }),
-              })
+              });
+              if (this.deps.isolateImplementers !== false && await canUseIsolatedWorktree(this.deps.workspaceRoot)) {
+                const isolated = await runInIsolatedWorktree({
+                  root: this.deps.workspaceRoot,
+                  signal,
+                  run,
+                  beforeApply: async (paths) => {
+                    if (this.deps.snapshotFile) {
+                      for (const p of paths) await this.deps.snapshotFile(p);
+                    }
+                  },
+                  log: (m) => this.cb.onEvent({ type: "tool_output", id: call.id, delta: m + "\n" }),
+                });
+                isolated.result.summary += `\n\nIsolation: merged ${isolated.changedPaths.length} file(s) from a disposable Git worktree.`;
+                return isolated.result;
+              }
+              this.cb.onEvent({ type: "tool_output", id: call.id, delta: "Git worktree isolation unavailable; using scoped direct execution.\n" });
+              return run(this.deps.workspaceRoot);
+            }
           : undefined,
     };
 
@@ -1084,6 +1157,7 @@ export class Agent {
         }
       }
       let content = result.content;
+      const evidence: string[] = [];
       if (!result.isError && paths.length) {
         // NOTE: prior reads of these paths are NOT stubbed here — message
         // history must stay append-only between compaction events or the
@@ -1092,6 +1166,7 @@ export class Agent {
         // pre-edit reads at the next planned cache miss instead.
         // Invalidate the in-memory read cache so subsequent reads fetch fresh data.
         for (const p of paths) readCacheInvalidatePath(p);
+        for (const p of paths) this.pendingValidationPaths.add(p);
         // Optional: match project style before checking diagnostics — format
         // stays AHEAD of diagnostics (it can change them); distinct files
         // format concurrently.
@@ -1106,20 +1181,30 @@ export class Agent {
         // Gathered concurrently (each diagnostics pass sleeps 400ms for the
         // language server; overlapping saves ~1-2.5s on multi-file edits),
         // appended in stable path order.
-        const diagPaths = paths.slice(0, 3);
+        const diagPaths = deferValidation
+          ? []
+          : [...this.pendingValidationPaths].slice(0, 5);
+        if (!deferValidation) this.pendingValidationPaths.clear();
+        if (deferValidation) {
+          content += "\n\nValidation deferred to the final edit in this batch.";
+        }
         const [diagResults, lintRaw] = await Promise.all([
           Promise.all(
             diagPaths.map((p) => postEditDiagnostics(this.deps.workspaceRoot, p, signal))
           ),
-          postEditLint(this.deps.workspaceRoot, paths[0]).catch(() => null),
+          diagPaths.length
+            ? postEditLint(this.deps.workspaceRoot, diagPaths[0]).catch(() => null)
+            : Promise.resolve(null),
         ]);
         let appendix = "";
         for (let d = 0; d < diagPaths.length; d++) {
           const diag = diagResults[d];
           if (!diag) {
             this.lastDiagReport.delete(diagPaths[d]);
+            evidence.push(`${diagPaths[d]}: diagnostics clean`);
             continue;
           }
+          evidence.push(firstLine(diag));
           // Consecutive edits often leave a pre-existing warning list
           // unchanged — repeat it as one line, not the full block again.
           if (this.lastDiagReport.get(diagPaths[d]) === diag) {
@@ -1132,12 +1217,15 @@ export class Agent {
         if (lintRaw) {
           const lint = filterLintAgainstDiagnostics(lintRaw, paths[0], diagResults[0]);
           if (lint) appendix += `\n\n${lint}`;
+          if (lint) evidence.push(firstLine(lint));
         }
         // Cap the combined appendix; head+tail so both the first errors and
         // the trailing summary survive.
         if (appendix) content += truncateHeadTail(appendix, 3500).text;
       }
       const diff = result.ui?.diff as import("../webview/protocol").DiffData | undefined;
+      const diffs = result.ui?.diffs as import("../webview/protocol").DiffData[] | undefined;
+      const report = result.ui?.report as import("../webview/protocol").ToolReport | undefined;
       this.cb.onEvent({
         type: "tool_end",
         id: call.id,
@@ -1145,6 +1233,9 @@ export class Agent {
         ok: !result.isError,
         summary: firstLine(result.content),
         diff,
+        diffs,
+        report,
+        evidence: evidence.length ? evidence : undefined,
       });
       return content;
     } catch (e: any) {

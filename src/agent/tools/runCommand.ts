@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
 import * as os from "os";
 import { Tool, ToolContext, ToolResult } from "./types";
-import { resolveInWorkspace, truncateHeadTail } from "./util";
+import { redactSecrets, resolveInWorkspace, truncateHeadTail } from "./util";
 import { getConfig } from "../../config";
 
 const MAX_OUTPUT_CHARS = 18_000;
@@ -57,6 +57,13 @@ export const runCommandTool: Tool = {
   },
   async execute(args, ctx): Promise<ToolResult> {
     const command: string = args.command;
+    if (ctx.writeScope?.length) {
+      const verification = /^(?:npm|pnpm|yarn) (?:run )?(?:test|check|lint|typecheck)\b|^(?:npx )?(?:tsc|jest|vitest)\b|^pytest\b|^cargo test\b|^go test\b/i.test(command.trim());
+      const hasShellControl = /[;&|<>`]|\$\(/.test(command);
+      if (hasShellControl || (classifyCommand(command) !== "safe" && !verification)) {
+        return { content: `Scoped implementers may only run read-only or verification commands. Rejected: ${command}`, isError: true };
+      }
+    }
     const blocked = isBlocked(command);
     if (blocked) {
       return {
@@ -191,5 +198,5 @@ function combine(stdout: string, stderr: string): string {
   const parts: string[] = [];
   if (stdout.trim()) parts.push(stdout.trimEnd());
   if (stderr.trim()) parts.push("[stderr]\n" + stderr.trimEnd());
-  return parts.join("\n");
+  return redactSecrets(parts.join("\n"));
 }

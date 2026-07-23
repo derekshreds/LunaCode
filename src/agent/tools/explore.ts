@@ -1,4 +1,5 @@
 import { Tool, ToolResult } from "./types";
+import { combineSubagentReports } from "../delegation";
 
 /**
  * Delegates open-ended research to one or more sub-agents, each with its own
@@ -59,10 +60,15 @@ export const exploreTool: Tool = {
     const MAX_PARALLEL = 4;
     const questions = list.slice(0, MAX_PARALLEL);
     const truncated = list.length > MAX_PARALLEL;
+    const estimate = ctx.estimateDelegation?.("research", questions.length);
+    if (estimate) ctx.emitOutput?.(
+      `Cost ceiling: ${questions.length} × ${estimate.maxContextTokens.toLocaleString()} tokens on ${estimate.model}` +
+      (estimate.estimatedCost != null ? ` ≈ $${estimate.estimatedCost.toFixed(4)}` : "") + "\n"
+    );
 
     if (questions.length === 1) {
-      const digest = await ctx.explore(questions[0]);
-      return { content: digest };
+      const result = await ctx.explore(questions[0]);
+      return { content: result.summary, ui: { report: result.report } };
     }
 
     // Parallel orchestration: each question runs in its own sub-agent context.
@@ -73,12 +79,13 @@ export const exploreTool: Tool = {
       questions.map(async (q, i) => {
         ctx.emitOutput?.(`[${i + 1}/${questions.length}] ${q.slice(0, 80)}${q.length > 80 ? "…" : ""}\n`);
         try {
-          const digest = await ctx.explore!(q);
-          return { q, digest, ok: true as const };
+          const result = await ctx.explore!(q);
+          return { q, result, ok: true as const };
         } catch (e: any) {
           return {
             q,
-            digest: `Explore failed: ${e?.message ?? e}`,
+            result: undefined,
+            error: `Explore failed: ${e?.message ?? e}`,
             ok: false as const,
           };
         }
@@ -87,12 +94,17 @@ export const exploreTool: Tool = {
 
     const parts = digests.map((d, i) => {
       const header = `## Research ${i + 1}: ${d.q}`;
-      return `${header}\n\n${d.digest}`;
+      return `${header}\n\n${d.result?.summary ?? d.error}`;
     });
     let content = parts.join("\n\n---\n\n");
     if (truncated) {
       content += `\n\n(Note: ${list.length - MAX_PARALLEL} additional question(s) were dropped — max ${MAX_PARALLEL} parallel explores.)`;
     }
-    return { content };
+    const completed = digests.flatMap((d) => (d.result ? [d.result] : []));
+    return {
+      content,
+      ...(completed.length ? { ui: { report: combineSubagentReports("research", completed) } } : {}),
+      isError: completed.length === 0,
+    };
   },
 };

@@ -141,6 +141,15 @@
         "title": "Luna Code: Export Session as Markdown"
       },
       {
+        "command": "lunacode.exportBenchmark",
+        "title": "Luna Code: Export Benchmark Metrics"
+      },
+      {
+        "command": "lunacode.openControlCenter",
+        "title": "Luna Code: Open Control Center",
+        "icon": "$(settings-gear)"
+      },
+      {
         "command": "lunacode.selectWorkspaceFolder",
         "title": "Luna Code: Select Working Folder (Multi-root)"
       }
@@ -202,6 +211,12 @@
     "configuration": {
       "title": "Luna Code",
       "properties": {
+        "lunacode.costProfile": {
+          "type": "string",
+          "enum": ["custom", "economy", "balanced", "quality"],
+          "default": "custom",
+          "description": "Last applied cost profile. Profiles update several concrete settings and remain fully editable afterward."
+        },
         "lunacode.model": {
           "type": "string",
           "default": "z-ai/glm-5.2",
@@ -356,14 +371,14 @@
         },
         "lunacode.subagentMaxContextTokens": {
           "type": "number",
-          "default": 60000,
+          "default": 32000,
           "minimum": 8000,
-          "description": "Token budget for explore/implement sub-agent contexts. When exceeded, the sub-agent is forced to answer from what it has. Lower = cheaper digests; higher = deeper research."
+          "description": "Token budget for explore/implement sub-agent contexts. The cost-conscious 32K default is enough for focused delegation; when exceeded, the sub-agent answers from what it has. Raise only for unusually broad research."
         },
         "lunacode.progressiveTools": {
           "type": "boolean",
           "default": true,
-          "description": "Start each turn with read/meta tool schemas only; unlock edit/exec tools after the first implement signal. Reduces fixed prompt tax on research-heavy turns. Tool-set changes only at iteration boundaries (cache-safe)."
+          "description": "In Standard mode, start each turn with read/meta tool schemas only, then unlock edit/exec tools after the first research round or implement signal. Auto mode always receives the full tool set immediately."
         },
         "lunacode.adaptiveReasoning": {
           "type": "boolean",
@@ -406,6 +421,22 @@
           "type": "boolean",
           "default": false,
           "description": "Sandbox mode: the agent works in a separate git worktree instead of your working tree. Review with the ± chip, then use 'Luna Code: Merge Sandbox Changes' to apply them to your real tree, or 'Discard Sandbox'. Note: dependencies (node_modules etc.) are not installed in the worktree."
+        },
+        "lunacode.verificationPolicy": {
+          "type": "string",
+          "enum": ["advisory", "standard", "strict"],
+          "default": "standard",
+          "description": "Verification gate policy shown in Control Center. Strict treats missing diagnostics or test evidence as a failure."
+        },
+        "lunacode.testFirstFixes": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ask the agent to reproduce bugs with a failing regression test before fixing them when practical."
+        },
+        "lunacode.durableQueue": {
+          "type": "boolean",
+          "default": true,
+          "description": "Persist queued and in-progress work so it can be inspected and resumed after an extension reload."
         },
         "lunacode.customCommands": {
           "type": "object",
@@ -511,7 +542,9 @@
     "check-types": "tsc --noEmit",
     "lint": "echo \"(no lint configured)\"",
     "pretest": "node scripts/build-tests.js",
-    "test": "node dist/test-context.js && node dist/test-usage.js && node dist/test-checkpoints.js && node dist/test-loop-guard.js"
+    "test": "node dist/test-context.js && node dist/test-usage.js && node dist/test-openrouter.js && node dist/test-checkpoints.js && node dist/test-loop-guard.js && node dist/test-write-tools.js && node dist/test-coordination.js && node dist/test-subagent.js && node dist/test-control-center.js",
+    "prebenchmark": "node scripts/build-benchmark.js",
+    "benchmark": "node dist/benchmark.js"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

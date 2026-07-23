@@ -35,3 +35,13 @@ export const MODES: Record<AgentMode, ModeInfo> = {
 export function isMode(value: string): value is AgentMode {
   return value === "standard" || value === "auto" || value === "plan";
 }
+
+/**
+ * Progressive schemas are an opt-in prompt-cost optimization for Standard
+ * mode. Auto must expose its complete write/exec surface from the first model
+ * call; otherwise the model can correctly conclude that the tools promised by
+ * the Auto-mode system prompt are unavailable and stop without acting.
+ */
+export function useProgressiveTools(mode: AgentMode, enabled: boolean): boolean {
+  return enabled && mode === "standard";
+}

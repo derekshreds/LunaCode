@@ -11,17 +11,28 @@ import { computeDiff, reconstructWithReverts } from "../diff";
 import { buildSystemPrompt } from "../agent/systemPrompt";
 import { OpenRouterClient, usesCacheControl } from "../openrouter/client";
 import { getConfig, SecretStore } from "../config";
-import { AgentMode, MODES } from "../modes";
+import { AgentMode, MODES, useProgressiveTools } from "../modes";
 import { ApprovalDecision, ApprovalRequest } from "../agent/tools/types";
-import { IGNORED_DIRS, resolveInWorkspace } from "../agent/tools/util";
-import { toolsForPhase, toToolDefinitions } from "../agent/tools";
+import { IGNORED_DIRS, redactSecrets, resolveInWorkspace } from "../agent/tools/util";
+import { toolsForPhase, toolsForSubagent, toolsForImplementer, toToolDefinitions } from "../agent/tools";
 import { SessionStore, StoredSession, deriveTitle } from "../sessions";
-import { AssistantMessage, ChatMessage } from "../openrouter/types";
+import { ChatMessage } from "../openrouter/types";
 import { UsageStore } from "../usage";
-import { SessionUsage, SettingsPayload, MentionItem } from "./protocol";
+import { SessionUsage, SettingsPayload, MentionItem, TurnReceipt } from "./protocol";
 import { McpManager } from "../mcp/manager";
 import { disposeAllProcesses, setProcessExitHandler } from "../agent/tools/backgroundProcess";
 import { getRepoMap } from "../agent/repoMap";
+import { messagesToEvents } from "./replay";
+import {
+  AuditEntry,
+  DurableQueueItem,
+  RecoveryRun,
+  budgetState,
+  buildAgentGraph,
+  verificationGates,
+} from "../controlCenter";
+import { buildRepoIntelligence } from "../agent/repoIntelligence";
+import { estimateToolSchemaTokens } from "../agent/delegation";
 import {
   StickyMemory,
   emptyStickyMemory,
@@ -46,6 +57,10 @@ const SLASH_COMMANDS: Record<string, string> = {
   doc: "Add or improve documentation (comments/README/docstrings) for the following, matching the project's existing style: $ARGUMENTS",
   optimize:
     "Profile or reason about the performance of the following and propose the smallest change that meaningfully improves it, then apply it: $ARGUMENTS",
+  tournament:
+    "Use the tournament tool to obtain two independent candidate analyses for this consequential decision, critically judge them, then implement or report the best synthesis: $ARGUMENTS",
+  regression:
+    "Treat this as a test-first bug fix. Reproduce it with a failing regression test, capture the failure, implement the smallest fix, and prove the same test passes: $ARGUMENTS",
 };
 
 function execGit(cwd: string, args: string[]): Promise<string> {
@@ -94,7 +109,11 @@ export class LunaCodeController {
   /** User messages waiting to run (queued while a turn is active). `echoId` ties
    * a queued message back to its transcript bubble so the rewind button can be
    * attached to it once the turn actually starts. */
-  private queue: Array<{ text: string; images?: string[]; echoId?: number }> = [];
+  private queue: Array<DurableQueueItem & { echoId?: number }> = [];
+  private queuePaused = false;
+  private recovery?: RecoveryRun;
+  private audit: AuditEntry[] = [];
+  private persistTimer?: ReturnType<typeof setTimeout>;
   /** Monotonic id for user-message bubbles (rewind bubble handle). */
   private echoSeq = 0;
 
@@ -132,6 +151,10 @@ export class LunaCodeController {
     hadEdits: boolean;
   }> = [];
   private activeCheckpoint: Map<string, string | null> | null = null;
+  private receipts: TurnReceipt[] = [];
+  private activeReceipt?: TurnReceipt;
+  private activeToolArgs = new Map<string, any>();
+  private activeToolMeta = new Map<string, { name: string; startedAt: number }>();
   private static MAX_CHECKPOINT_TURNS = 10;
   private static MAX_CHECKPOINT_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -190,6 +213,7 @@ export class LunaCodeController {
   }
 
   dispose() {
+    if (this.persistTimer) clearTimeout(this.persistTimer);
     this.mcp.dispose();
     this.editorTracker?.dispose();
     disposeAllProcesses();
@@ -224,6 +248,7 @@ export class LunaCodeController {
       msg.type === "sessionList" ||
       msg.type === "settingsData" ||
       msg.type === "usageReport" ||
+      msg.type === "controlCenter" ||
       msg.type === "streamProgress" ||
       msg.type === "toolOutput" || // live-only; a flood would evict the transcript
       msg.type === "reasoning" || // live-only thinking; not part of stored messages
@@ -249,11 +274,18 @@ export class LunaCodeController {
     this.sessionApprovedKinds.clear();
     this.pendingSelections = [];
     this.queue = [];
+    this.recovery = undefined;
+    this.queuePaused = false;
+    this.audit = [];
     this.transcript = [];
     this.currentSessionId = undefined;
     this.currentCreatedAt = 0;
     this.sessionUsage = { promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0 };
     this.turns = [];
+    this.receipts = [];
+    this.activeReceipt = undefined;
+    this.activeToolArgs.clear();
+    this.activeToolMeta.clear();
     this.activeCheckpoint = null;
     this.sessionMcpTools = null; // pick up newly-connected MCP servers
     this.sessionToolPhase = "read";
@@ -321,6 +353,7 @@ export class LunaCodeController {
       workspaceOverview: this.overviewCache.text,
       repoMap,
       projectMemory: this.projectMemory(root, !!opts?.refreshVolatile),
+      testFirstFixes: getConfig().testFirstFixes,
     });
   }
 
@@ -418,6 +451,9 @@ export class LunaCodeController {
       case "getSettings":
         this.sendSettings();
         break;
+      case "applyCostProfile":
+        await this.applyCostProfile(msg.profile);
+        break;
       case "updateSetting":
         await this.updateSetting(msg.key, msg.value);
         break;
@@ -438,6 +474,40 @@ export class LunaCodeController {
         break;
       case "getContextInfo":
         void this.sendContextInfo();
+        break;
+      case "getControlCenter":
+        void this.sendControlCenter();
+        break;
+      case "pauseQueue":
+        this.queuePaused = msg.paused;
+        if (!this.queuePaused) void this.pump();
+        this.schedulePersist();
+        void this.sendControlCenter();
+        break;
+      case "removeQueued":
+        this.queue = this.queue.filter((q) => q.id !== msg.id);
+        this.schedulePersist();
+        void this.sendControlCenter();
+        break;
+      case "resumeRecovery":
+        this.resumeRecovery();
+        break;
+      case "discardRecovery":
+        this.recovery = undefined;
+        this.addAudit("recovery", "Discard recovery", "Interrupted run", "completed");
+        this.schedulePersist();
+        void this.sendControlCenter();
+        break;
+      case "mergeSandbox":
+        await this.mergeSandbox();
+        void this.sendControlCenter();
+        break;
+      case "discardSandbox":
+        await this.discardSandbox();
+        void this.sendControlCenter();
+        break;
+      case "retryGraphNode":
+        await this.onSend(`Retry this delegated task from the current repository state. Re-check prior assumptions and evidence before acting:\n\n${msg.prompt}`);
         break;
       case "retryTurn":
         await this.rewindTo(this.lastTurnId(), "rerun");
@@ -474,6 +544,7 @@ export class LunaCodeController {
     this.post({
       type: "settingsData",
       settings: {
+        costProfile: cfg.costProfile,
         model: cfg.model,
         summarizerModel: cfg.summarizerModel,
         subagentModel: cfg.subagentModel,
@@ -504,6 +575,9 @@ export class LunaCodeController {
         formatAfterEdit: cfg.formatAfterEdit,
         revealEditedFiles: cfg.revealEditedFiles,
         worktreeMode: cfg.worktreeMode,
+        verificationPolicy: cfg.verificationPolicy,
+        testFirstFixes: cfg.testFirstFixes,
+        durableQueue: cfg.durableQueue,
         autoApproveCommands: cfg.autoApproveCommands,
         alwaysDenyCommands: cfg.alwaysDenyCommands,
         baseUrl: cfg.baseUrl,
@@ -516,6 +590,7 @@ export class LunaCodeController {
   /** Settings keys the GUI is allowed to write. Guards against arbitrary keys
    * arriving from a compromised or stale webview. */
   private static WRITABLE_SETTINGS = new Set<keyof SettingsPayload>([
+    "costProfile",
     "model",
     "summarizerModel",
     "subagentModel",
@@ -535,6 +610,9 @@ export class LunaCodeController {
     "formatAfterEdit",
     "revealEditedFiles",
     "worktreeMode",
+    "verificationPolicy",
+    "testFirstFixes",
+    "durableQueue",
     "maxContextTokens",
     "autoBudgetCarryCostUsd",
     "compactionTargetRatio",
@@ -579,14 +657,35 @@ export class LunaCodeController {
     }
     if (!LunaCodeController.WRITABLE_SETTINGS.has(key)) return;
     try {
-      await vscode.workspace
-        .getConfiguration("lunacode")
-        .update(key, value, vscode.ConfigurationTarget.Global);
+      const config = vscode.workspace.getConfiguration("lunacode");
+      await config.update(key, value, vscode.ConfigurationTarget.Global);
+      if (key !== "costProfile") {
+        await config.update("costProfile", "custom", vscode.ConfigurationTarget.Global);
+      }
     } catch (e: any) {
       this.post({ type: "error", message: `Could not save setting "${key}": ${e?.message ?? e}` });
     }
     // Echo the (clamped, validated) effective config back so the GUI reflects
     // what will actually be used, and refresh the model chip.
+    this.sendSettings();
+    await this.sendConfig();
+  }
+
+  private async applyCostProfile(profile: "economy" | "balanced" | "quality") {
+    const values = profile === "economy"
+      ? { providerSort: "price", reasoningEffort: "low", subagentMaxContextTokens: 16000, autoBudgetCarryCostUsd: 0.04, compactionTargetRatio: 0.3, progressiveTools: true, adaptiveReasoning: true, maxTurns: 120, prewarmCache: false }
+      : profile === "quality"
+        ? { providerSort: "throughput", reasoningEffort: "high", subagentMaxContextTokens: 60000, autoBudgetCarryCostUsd: 0.25, compactionTargetRatio: 0.45, progressiveTools: false, adaptiveReasoning: false, maxTurns: 300, prewarmCache: true }
+        : { providerSort: "throughput", reasoningEffort: "default", subagentMaxContextTokens: 32000, autoBudgetCarryCostUsd: 0.1, compactionTargetRatio: 0.35, progressiveTools: true, adaptiveReasoning: true, maxTurns: 200, prewarmCache: false };
+    const config = vscode.workspace.getConfiguration("lunacode");
+    await Promise.all([
+      config.update("costProfile", profile, vscode.ConfigurationTarget.Global),
+      ...Object.entries(values).map(([key, value]) => config.update(key, value, vscode.ConfigurationTarget.Global)),
+    ]);
+    this.post({
+      type: "status",
+      message: `Applied ${profile} profile.${profile === "economy" && !getConfig().subagentModel ? " For maximum savings, choose a cheap Subagent model in Settings." : ""}`,
+    });
     this.sendSettings();
     await this.sendConfig();
   }
@@ -631,12 +730,16 @@ export class LunaCodeController {
       const cp = stored[i]?.checkpoint;
       return { id: st.id, checkpoint: cp ? new Map(cp) : null, hadEdits: !!(cp && cp.length) };
     });
+    this.receipts = s.receipts ?? [];
 
     this.postCheckpointState();
     this.post({ type: "taskList", tasks: [] });
     this.sessionApprovedKinds.clear();
     this.pendingSelections = [];
-    this.queue = [];
+    this.queue = (s.pendingQueue ?? []).map((q) => ({ ...q, status: "queued" as const }));
+    this.recovery = s.activeRun;
+    this.queuePaused = s.queuePaused ?? !!(this.recovery || this.queue.length);
+    this.audit = (s.audit ?? []).slice(-200);
     this.transcript = [];
     this.sessionUsage = s.usage ?? {
       promptTokens: 0,
@@ -663,10 +766,14 @@ export class LunaCodeController {
 
     this.post({ type: "sessionUsage", usage: this.sessionUsage });
     const rewindIdByIndex = new Map(starts.map((st) => [st.index, st.id]));
-    for (const ev of messagesToEvents(s.messages, rewindIdByIndex)) {
+    const receiptById = new Map(this.receipts.map((r) => [r.id, r]));
+    for (const ev of messagesToEvents(s.messages, rewindIdByIndex, receiptById)) {
       this.post(ev);
     }
     this.postRewindState();
+    if (this.recovery) {
+      this.post({ type: "status", message: "An interrupted run is available in Control Center for safe resumption." });
+    }
   }
 
   /** Turn ledger from a stored session, with a best-effort fallback for legacy
@@ -708,12 +815,29 @@ export class LunaCodeController {
       usage: this.sessionUsage,
       turns: this.serializeTurns(),
       stickyMemory: this.stickyMemory,
+      receipts: this.receipts.slice(-100),
+      pendingQueue: getConfig().durableQueue
+        ? this.queue.map(({ echoId: _echoId, ...q }) => ({ ...q, status: "queued" as const }))
+        : undefined,
+      activeRun: getConfig().durableQueue ? this.recovery : undefined,
+      queuePaused: this.queuePaused,
+      audit: this.audit.slice(-200),
     };
     try {
       await this.sessions.save(session);
     } catch (e: any) {
       this.output.appendLine(`Failed to save session: ${e?.message ?? e}`);
     }
+  }
+
+  /** Coalesce crash-safety writes so streaming events do not hammer Memento. */
+  private schedulePersist(delayMs = 200): void {
+    if (!getConfig().durableQueue) return;
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      void this.persistCurrent();
+    }, delayMs);
   }
 
   private async sendInit(source: vscode.Webview) {
@@ -943,6 +1067,7 @@ export class LunaCodeController {
     }
 
     // Slash commands: /name expands to its template (with argument interpolation).
+    if (/^\/tournament(?:\s|$)/i.test(trimmed)) this.sessionToolPhase = "all";
     let userText = this.expandSlash(trimmed);
 
     // Fold any queued editor selections into this message now.
@@ -961,10 +1086,18 @@ export class LunaCodeController {
     this.post({
       type: "userEcho",
       text: trimmed + (images?.length ? `\n\n🖼 ${images.length} image(s) attached` : ""),
-      queued: this.running,
+      queued: this.running || this.queuePaused,
       echoId,
     });
-    this.queue.push({ text: userText, images, echoId });
+    this.queue.push({
+      id: `job_${Date.now().toString(36)}_${echoId}`,
+      text: userText,
+      images,
+      echoId,
+      createdAt: Date.now(),
+      status: "queued",
+    });
+    this.schedulePersist();
     void this.pump();
   }
 
@@ -991,17 +1124,45 @@ export class LunaCodeController {
 
   /** Run queued turns one at a time, FIFO, until the queue drains. */
   private async pump() {
-    if (this.running) return;
+    if (this.running || this.queuePaused) return;
     const next = this.queue.shift();
     if (next === undefined) return;
+    next.status = "running";
     this.running = true;
+    this.recovery = {
+      id: next.id,
+      text: next.text,
+      model: getConfig().model,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+      lastEvent: "starting",
+      toolCalls: 0,
+    };
+    this.schedulePersist(0);
     try {
       await this.runTurn(next.text, next.images, next.echoId);
     } finally {
       this.running = false;
+      this.recovery = undefined;
       await this.persistCurrent();
       if (this.queue.length) void this.pump();
     }
+  }
+
+  private resumeRecovery(): void {
+    if (!this.recovery) return;
+    const previous = this.recovery;
+    this.queue.unshift({
+      id: `resume_${Date.now().toString(36)}`,
+      text: `Resume the interrupted task from the existing conversation and workspace state. Inspect what already completed before acting. Original goal:\n\n${previous.text}`,
+      createdAt: Date.now(),
+      status: "queued",
+    });
+    this.recovery = undefined;
+    this.queuePaused = false;
+    this.addAudit("recovery", "Resume interrupted run", previous.text.slice(0, 160), "allowed");
+    this.schedulePersist(0);
+    void this.pump();
   }
 
   private async runTurn(userText: string, images?: string[], echoId?: number) {
@@ -1021,6 +1182,7 @@ export class LunaCodeController {
       apiKey,
       baseUrl: cfg.baseUrl,
       model: cfg.model,
+      fallbackModels: cfg.fallbackModels,
       dataCollection: cfg.dataCollection,
       zdr: cfg.zeroDataRetention,
       providerSort: cfg.providerSort,
@@ -1054,6 +1216,8 @@ export class LunaCodeController {
         // model's prompt cache on every swap (caches are per-model).
         plannerModel: cfg.plannerModel,
         implementerModel: cfg.implementerModel,
+        tournamentModels: [cfg.plannerModel, cfg.subagentModel, ...cfg.fallbackModels, cfg.model],
+        isolateImplementers: true,
         subagentMaxContextTokens: cfg.subagentMaxContextTokens,
         progressiveTools: cfg.progressiveTools,
         initialToolPhase: this.sessionToolPhase,
@@ -1072,6 +1236,17 @@ export class LunaCodeController {
         formatAfterEdit: cfg.formatAfterEdit,
         stickyMemory: this.stickyMemory,
         cacheDigests: this.cacheDigests,
+        estimateDelegation: (kind, agents) => {
+          const model = kind === "implementation"
+            ? cfg.implementerModel || cfg.subagentModel || cfg.model
+            : cfg.subagentModel || cfg.plannerModel || cfg.model;
+          const price = this.lookupModelMeta(model)?.promptPrice;
+          return {
+            model,
+            maxContextTokens: cfg.subagentMaxContextTokens,
+            estimatedCost: price ? agents * cfg.subagentMaxContextTokens * price : undefined,
+          };
+        },
         // Called at compaction — a planned cache miss — so refreshing the
         // volatile prompt inputs (repo map, project memory) there is free.
         refreshSystemPrompt: () => applyPrompt({ refreshVolatile: true }),
@@ -1099,6 +1274,22 @@ export class LunaCodeController {
       hadEdits: false,
     };
     this.turns.push(entry);
+    this.activeReceipt = {
+      id: turnStartId,
+      startedAt: Date.now(),
+      endedAt: 0,
+      model: cfg.model,
+      stopReason: "running",
+      toolCalls: 0,
+      files: [],
+      commands: [],
+      subagents: [],
+      evidence: [],
+      failures: [],
+      usage: { promptTokens: 0, completionTokens: 0, cachedTokens: 0, cost: 0 },
+      schemaTokens: 0,
+    };
+    this.activeToolArgs.clear();
     try {
       await this.agent.run(userText, this.mode, images);
     } finally {
@@ -1106,6 +1297,7 @@ export class LunaCodeController {
         // The turn never registered its user message (e.g. an early error).
         const i = this.turns.indexOf(entry);
         if (i >= 0) this.turns.splice(i, 1);
+        this.activeReceipt = undefined;
       } else {
         entry.hadEdits = !!(this.activeCheckpoint && this.activeCheckpoint.size > 0);
         if (!entry.hadEdits) entry.checkpoint = null;
@@ -1296,7 +1488,11 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
     }
     // Truncate context + ledger + queue.
     const rolled = this.context.rollbackToIndex(idx);
-    if (k >= 0) this.turns.splice(k);
+    if (k >= 0) {
+      const discarded = new Set(this.turns.slice(k).map((t) => t.id));
+      this.turns.splice(k);
+      this.receipts = this.receipts.filter((r) => !discarded.has(r.id));
+    }
     this.queue = [];
     // Trim the replay transcript from the target bubble onward.
     const cut = this.transcript.findIndex((m) => m.type === "userEcho" && m.rewindId === id);
@@ -1318,9 +1514,12 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
       const echoId = this.echoSeq++;
       this.post({ type: "userEcho", text: rolled.text, queued: false, echoId });
       this.queue.push({
+        id: `rerun_${Date.now().toString(36)}_${echoId}`,
         text: rolled.text,
         images: rolled.images.length ? rolled.images : undefined,
         echoId,
+        createdAt: Date.now(),
+        status: "queued",
       });
       void this.pump();
     } else if (mode === "edit" && rolled) {
@@ -1389,7 +1588,7 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
   /** Side-by-side diffs of the last turn's edits (checkpoint vs disk). */
   private sendTurnDiff() {
     const checkpoint = this.topCheckpoint();
-    const root = this.workspaceRoot();
+    const root = this.sandbox?.dir ?? this.workspaceRoot();
     if (!checkpoint || !root) {
       this.post({ type: "status", message: "No turn edits to review." });
       return;
@@ -1410,7 +1609,7 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
   }
 
   private reviewAbs(rel: string): string | undefined {
-    const root = this.workspaceRoot();
+    const root = this.sandbox?.dir ?? this.workspaceRoot();
     if (!root) return undefined;
     return path.isAbsolute(rel) ? rel : path.join(root, rel);
   }
@@ -1492,6 +1691,10 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
 
   /** Stage + commit the last turn's edited files with a generated message. */
   private async commitLastTurn() {
+    if (this.sandbox) {
+      this.post({ type: "status", message: "Review the patch here, then merge the isolated worktree from Control Center before committing in your workspace." });
+      return;
+    }
     const checkpoint = this.topCheckpoint();
     const root = this.workspaceRoot();
     if (!checkpoint || !root) {
@@ -1571,6 +1774,101 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
         stubbedToolResults: bd.stubbedToolResults,
       },
     });
+  }
+
+  /** One consolidated operational snapshot for the Control Center sheet. */
+  private async sendControlCenter(): Promise<void> {
+    const root = this.workspaceRoot();
+    if (!root) return;
+    const cfg = getConfig();
+    const repo = await buildRepoIntelligence(root, this.receipts);
+    const phases: Array<[string, ReturnType<typeof toolsForPhase>]> = [
+      ["read", toolsForPhase(false, "read")],
+      ["full", toolsForPhase(false, "all")],
+      ["researcher", toolsForSubagent()],
+      ["implementer", toolsForImplementer()],
+    ];
+    const tools = phases.map(([phase, list]) => {
+      const defs = toToolDefinitions(list);
+      const perTool = defs.map((d) => ({
+        name: d.function.name,
+        estimatedTokens: Math.ceil(JSON.stringify(d).length / 4),
+      })).sort((a, b) => b.estimatedTokens - a.estimatedTokens);
+      return {
+        phase,
+        tools: defs.length,
+        estimatedTokens: estimateToolSchemaTokens(defs),
+        largest: perTool.slice(0, 5),
+      };
+    });
+    let sandbox: { branch: string; dir: string; changedFiles: number } | undefined;
+    if (this.sandbox) {
+      const changed = await execGit(this.sandbox.dir, ["status", "--porcelain"]).catch(() => "");
+      sandbox = {
+        ...this.sandbox,
+        changedFiles: changed.split("\n").filter(Boolean).length,
+      };
+    }
+    const memoryPath = ["LUNA.md", "AGENTS.md", "CLAUDE.md"]
+      .map((name) => path.join(root, name))
+      .find((p) => fs.existsSync(p));
+    const memory = memoryPath ? fs.readFileSync(memoryPath, "utf8").slice(0, 12_000) : "";
+    const graph = buildAgentGraph(this.receipts, this.recovery);
+    for (const [id, meta] of this.activeToolMeta) {
+      if (meta.name !== "explore" && meta.name !== "implement" && meta.name !== "tournament") continue;
+      graph.push({
+        id: `active-tool-${id}`,
+        label: meta.name === "implement" ? "Implementer delegation" : meta.name === "tournament" ? "Model tournament" : "Research delegation",
+        kind: meta.name === "implement" ? "implementation" : "research",
+        status: "running",
+        durationMs: Date.now() - meta.startedAt,
+        parent: this.recovery ? `active-${this.recovery.id}` : undefined,
+      });
+    }
+    this.post({
+      type: "controlCenter",
+      snapshot: {
+        queue: this.queue.map(({ echoId: _echoId, ...q }) => q),
+        queuePaused: this.queuePaused,
+        recovery: this.recovery,
+        sandbox,
+        verificationPolicy: cfg.verificationPolicy,
+        gates: verificationGates(this.receipts[this.receipts.length - 1], cfg.verificationPolicy),
+        budget: budgetState(
+          this.sessionUsage.cost,
+          cfg.sessionBudgetUsd,
+          this.receipts.slice(-5).map((r) => r.usage.cost ?? 0)
+        ),
+        graph,
+        repo,
+        tools,
+        audit: this.audit.slice(-100).reverse(),
+        memory: {
+          path: memoryPath ? path.relative(root, memoryPath) : undefined,
+          contents: memory,
+          decisions: this.stickyMemory.decisions.slice(-20),
+        },
+      },
+    });
+  }
+
+  private addAudit(
+    kind: AuditEntry["kind"],
+    action: string,
+    subject: string,
+    outcome: AuditEntry["outcome"],
+    detail?: string
+  ): void {
+    this.audit.push({
+      id: `audit_${Date.now().toString(36)}_${this.audit.length}`,
+      at: Date.now(),
+      kind,
+      action,
+      subject,
+      outcome,
+      detail,
+    });
+    if (this.audit.length > 200) this.audit.splice(0, this.audit.length - 200);
   }
 
   /** Fuzzy file matches for @-mention completion (cached workspace walk). */
@@ -1722,6 +2020,7 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
         }
       }
       this.sandbox = { dir, branch };
+      this.addAudit("sandbox", "Create isolated worktree", branch, "completed", dir);
       this.post({
         type: "status",
         message: `🏝 Sandbox mode: the agent works in a separate git worktree (branch ${branch}). Use "Luna Code: Merge Sandbox Changes" to apply, "Discard Sandbox" to throw away. Note: dependencies aren't installed there.`,
@@ -1763,7 +2062,9 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
         type: "status",
         message: `✓ Sandbox changes applied to your working tree. Run "Luna Code: Discard Sandbox" when you're done with it.`,
       });
+      this.addAudit("sandbox", "Merge sandbox patch", this.sandbox.branch, "completed");
     } catch (e: any) {
+      this.addAudit("sandbox", "Merge sandbox patch", this.sandbox?.branch ?? "sandbox", "failed", e?.message ?? String(e));
       this.post({ type: "error", message: `Sandbox merge failed: ${e?.message ?? e}` });
     }
   }
@@ -1778,6 +2079,7 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
     await execGit(real, ["worktree", "remove", "--force", dir]).catch(() => {});
     await execGit(real, ["branch", "-D", branch]).catch(() => {});
     this.sandbox = undefined;
+    this.addAudit("sandbox", "Discard isolated worktree", branch, "completed");
     this.post({ type: "status", message: "Sandbox discarded." });
   }
 
@@ -1785,6 +2087,11 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
   async sendExternal(text: string) {
     await vscode.commands.executeCommand("lunacode.openChat");
     await this.onSend(text);
+  }
+
+  async openControlCenter(): Promise<void> {
+    await vscode.commands.executeCommand("lunacode.openChat");
+    await this.sendControlCenter();
   }
 
   /** Export the current conversation as a Markdown document. */
@@ -1814,6 +2121,21 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
       language: "markdown",
     });
     await vscode.window.showTextDocument(doc);
+  }
+
+  async exportBenchmarkMetrics() {
+    if (!this.receipts.length) {
+      void vscode.window.showInformationMessage("Luna Code: no completed turn receipts to export yet.");
+      return;
+    }
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(path.join(this.workspaceRoot() ?? os.homedir(), `lunacode-benchmark-${Date.now()}.json`)),
+      filters: { JSON: ["json"] },
+      saveLabel: "Export benchmark metrics",
+    });
+    if (!uri) return;
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify({ receipts: this.receipts }, null, 2), "utf8"));
+    void vscode.window.showInformationMessage(`Luna Code: exported ${this.receipts.length} turn receipt(s).`);
   }
 
   /** Available slash commands (builtins + custom), for composer autocomplete. */
@@ -1894,6 +2216,7 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
       // Always the true primary: main-loop calls never swap models unless the
       // user explicitly sets plannerModel, so this prefix is the one that pays.
       model: cfg.model,
+      fallbackModels: cfg.fallbackModels,
       dataCollection: cfg.dataCollection,
       zdr: cfg.zeroDataRetention,
       providerSort: cfg.providerSort,
@@ -1902,10 +2225,9 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
       promptCacheKey: this.promptCacheKey,
     });
     const allowsMutation = MODES[this.mode].allowsMutation;
-    // Mirror the first real call's tool set exactly — with progressive tools
-    // on, that's the read/meta phase; prewarming the full set would never match.
-    const progressive =
-      cfg.progressiveTools && allowsMutation && this.mode !== "plan";
+    // Mirror the first real call's tool set exactly. Standard may begin with
+    // read/meta only; Auto and Plan start with their complete allowed sets.
+    const progressive = useProgressiveTools(this.mode, cfg.progressiveTools);
     const phase = progressive ? this.sessionToolPhase : "all";
     const tools = [
       ...toolsForPhase(!allowsMutation, phase),
@@ -2012,11 +2334,20 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
 
   private askApproval(req: ApprovalRequest): Promise<ApprovalDecision> {
     if (this.sessionApprovedKinds.has(req.kind)) {
+      this.addAudit("approval", req.title, req.subject, "allowed", "Allowed by this session's remembered approval.");
       return Promise.resolve("approved");
     }
     const id = `appr_${this.approvalSeq++}`;
     return new Promise<ApprovalDecision>((resolve) => {
       this.pendingApprovals.set(id, (decision) => {
+        this.addAudit(
+          "approval",
+          req.title,
+          req.subject,
+          decision === "rejected" ? "denied" : "allowed",
+          decision === "approved-always" ? "Approved for the remainder of this session." : req.detail
+        );
+        this.schedulePersist();
         if (decision === "approved-always") {
           this.sessionApprovedKinds.add(req.kind);
           resolve("approved");
@@ -2072,6 +2403,14 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
   }
 
   private forwardEvent(e: import("../agent/agent").AgentEvent) {
+    if (this.recovery) {
+      this.recovery.updatedAt = Date.now();
+      this.recovery.lastEvent = e.type;
+      if (e.type === "tool_start") this.recovery.toolCalls++;
+      if (e.type === "tool_start" || e.type === "tool_end" || e.type === "turn_start" || e.type === "usage") {
+        this.schedulePersist();
+      }
+    }
     switch (e.type) {
       case "turn_start":
         this.post({ type: "turnStart", model: this.activeModel || getConfig().model });
@@ -2083,21 +2422,52 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
         this.post({ type: "reasoning", delta: e.delta });
         break;
       case "tool_start":
+        this.activeToolArgs.set(e.id, e.args);
+        this.activeToolMeta.set(e.id, { name: e.name, startedAt: Date.now() });
         this.post({ type: "toolStart", id: e.id, name: e.name, args: e.args });
         break;
       case "tool_end":
-        this.post({ type: "toolEnd", id: e.id, name: e.name, ok: e.ok, summary: e.summary, diff: e.diff });
+        this.post({ type: "toolEnd", id: e.id, name: e.name, ok: e.ok, summary: e.summary, diff: e.diff, diffs: e.diffs, report: e.report });
         // Attribute code lines written/removed to the active model.
-        if (e.ok && e.diff && (e.diff.addCount || e.diff.delCount)) {
+        const eventDiffs = e.diffs?.length ? e.diffs : e.diff ? [e.diff] : [];
+        if (e.ok && eventDiffs.length) {
           void this.usage.recordCode({
             ts: Date.now(),
             model: this.activeModel || getConfig().model,
-            added: e.diff.addCount,
-            removed: e.diff.delCount,
+            added: eventDiffs.reduce((n, diff) => n + diff.addCount, 0),
+            removed: eventDiffs.reduce((n, diff) => n + diff.delCount, 0),
           });
         }
         // Reveal the edited file live (non-intrusive: preview tab, focus stays).
         if (e.ok) void this.revealEditedFile(e.name, e.diff);
+        if (e.name === "run_command") {
+          const command = this.activeToolArgs.get(e.id)?.command;
+          this.addAudit("command", "Run command", redactSecrets(typeof command === "string" ? command : e.name), e.ok ? "completed" : "failed", redactSecrets(e.summary.slice(0, 500)));
+        } else if (LunaCodeController.EDIT_TOOL_NAMES.has(e.name)) {
+          const paths = eventDiffs.map((d) => d.path).join(", ") || e.name;
+          this.addAudit("write", e.name, paths, e.ok ? "completed" : "failed", e.summary.slice(0, 500));
+        }
+        if (this.activeReceipt) {
+          this.activeReceipt.toolCalls++;
+          if (!e.ok) this.activeReceipt.failures.push(`${e.name}: ${e.summary}`);
+          for (const diff of e.ok ? eventDiffs : []) {
+            const prior = this.activeReceipt.files.find((f) => f.path === diff.path);
+            if (prior) {
+              prior.added += diff.addCount;
+              prior.removed += diff.delCount;
+            } else {
+              this.activeReceipt.files.push({ path: diff.path, added: diff.addCount, removed: diff.delCount });
+            }
+          }
+          if (e.report) this.activeReceipt.subagents.push(e.report);
+          if (e.evidence) this.activeReceipt.evidence.push(...e.evidence);
+          if (e.name === "run_command") {
+            const command = this.activeToolArgs.get(e.id)?.command;
+            if (typeof command === "string") this.activeReceipt.commands.push({ command, ok: e.ok, summary: e.summary });
+          }
+        }
+        this.activeToolArgs.delete(e.id);
+        this.activeToolMeta.delete(e.id);
         break;
       case "status":
         this.post({ type: "status", message: e.message });
@@ -2125,6 +2495,12 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
           cachedTokens: this.sessionUsage.cachedTokens + (e.cachedTokens || 0),
           cost: this.sessionUsage.cost + cost,
         };
+        if (this.activeReceipt) {
+          this.activeReceipt.usage.promptTokens += e.usage.prompt_tokens || 0;
+          this.activeReceipt.usage.completionTokens += e.usage.completion_tokens || 0;
+          this.activeReceipt.usage.cachedTokens += e.cachedTokens || 0;
+          this.activeReceipt.usage.cost = (this.activeReceipt.usage.cost ?? 0) + cost;
+        }
         this.post({ type: "sessionUsage", usage: this.sessionUsage });
         // Persist to the global analytics store, attributed to the model that
         // actually incurred it (summarizer calls carry their own model).
@@ -2140,6 +2516,10 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
       }
       case "tasks":
         this.post({ type: "taskList", tasks: e.tasks });
+        break;
+      case "tool_schema":
+        if (this.activeReceipt) this.activeReceipt.schemaTokens = Math.max(this.activeReceipt.schemaTokens ?? 0, e.estimatedTokens);
+        this.output.appendLine(`[lunacode] tool schema: ${e.tools} tools, ~${e.estimatedTokens} tokens`);
         break;
       case "stream_progress":
         this.post({ type: "streamProgress", tokens: e.tokens });
@@ -2157,9 +2537,45 @@ Luna Code reads this file every turn. Keep it terse. Good things to record:
         break;
       case "error":
         this.post({ type: "error", message: e.message });
+        this.addAudit("recovery", "Turn error", this.recovery?.text.slice(0, 160) ?? "active turn", "failed", e.message);
         break;
       case "turn_end":
         this.post({ type: "turnEnd", stopReason: e.stopReason });
+        if (this.activeReceipt) {
+          // Subagent patches land outside the parent's edit-tool result. Fold
+          // every checkpointed file into the receipt so Patch Studio, metrics,
+          // and intent-level undo all describe the complete change set.
+          const activeRoot = this.sandbox?.dir ?? this.workspaceRoot();
+          for (const [abs, before] of this.activeCheckpoint ?? []) {
+            const rel = activeRoot ? path.relative(activeRoot, abs).split(path.sep).join("/") : abs;
+            if (this.activeReceipt.files.some((f) => f.path === rel)) continue;
+            let after = "";
+            try { after = fs.readFileSync(abs, "utf8"); } catch { /* deleted */ }
+            const diff = computeDiff(before ?? "", after, rel);
+            if (diff.addCount || diff.delCount) {
+              this.activeReceipt.files.push({ path: rel, added: diff.addCount, removed: diff.delCount });
+            }
+          }
+          this.activeReceipt.endedAt = Date.now();
+          this.activeReceipt.stopReason = e.stopReason;
+          const gates = verificationGates(this.activeReceipt, getConfig().verificationPolicy);
+          this.activeReceipt.evidence.push(...gates.map((g) => `${g.label}: ${g.status} — ${g.detail}`));
+          if (getConfig().verificationPolicy === "strict") {
+            const failed = gates.filter((g) => g.status === "fail");
+            if (failed.length) {
+              this.activeReceipt.failures.push(...failed.map((g) => `Verification gate ${g.label}: ${g.detail}`));
+              this.post({ type: "status", message: `Strict verification: ${failed.map((g) => g.label).join(", ")} did not pass. Review the receipt before accepting the result.` });
+            }
+          }
+          this.activeReceipt.evidence = [...new Set(this.activeReceipt.evidence)].slice(0, 20);
+          this.activeReceipt.failures = [...new Set(this.activeReceipt.failures)].slice(0, 20);
+          this.receipts.push(this.activeReceipt);
+          if (this.receipts.length > 100) this.receipts.splice(0, this.receipts.length - 100);
+          this.post({ type: "turnReceipt", receipt: this.activeReceipt });
+          this.activeReceipt = undefined;
+        }
+        this.recovery = undefined;
+        this.schedulePersist(0);
         break;
     }
   }
@@ -2280,46 +2696,6 @@ function extractText(content: ChatMessage["content"]): string {
     return content.map((p) => (p.type === "text" ? p.text : "")).join("");
   }
   return "";
-}
-
-/** Reconstruct UI events from stored messages so a loaded session re-renders.
- * `rewindIdByIndex` tags turn-start user bubbles with their rewind id. */
-function messagesToEvents(
-  messages: ChatMessage[],
-  rewindIdByIndex?: Map<number, number>
-): HostToWebview[] {
-  const events: HostToWebview[] = [];
-  const toolNames = new Map<string, string>();
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    if (m.role === "user") {
-      const t = extractText(m.content);
-      if (t.trim()) {
-        const rewindId = rewindIdByIndex?.get(i);
-        events.push(rewindId !== undefined ? { type: "userEcho", text: t, rewindId } : { type: "userEcho", text: t });
-      }
-    } else if (m.role === "assistant") {
-      const t = extractText(m.content);
-      if (t.trim()) events.push({ type: "assistantText", delta: t });
-      const a = m as AssistantMessage;
-      for (const tc of a.tool_calls ?? []) {
-        let args: any = {};
-        try {
-          args = tc.function.arguments ? JSON.parse(tc.function.arguments) : {};
-        } catch {
-          /* ignore */
-        }
-        toolNames.set(tc.id, tc.function.name);
-        events.push({ type: "toolStart", id: tc.id, name: tc.function.name, args });
-      }
-    } else if (m.role === "tool") {
-      const summary = (extractText(m.content).split("\n")[0] ?? "").trim();
-      const name = toolNames.get(m.tool_call_id) ?? "tool";
-      const ok = !/^(Error|User rejected|Blocked|Cannot|Invalid|Command blocked)/i.test(summary);
-      events.push({ type: "toolEnd", id: m.tool_call_id, name, ok, summary });
-    }
-  }
-  return events;
 }
 
 /** Fresh session key for OpenAI prompt-cache routing (prompt_cache_key). */
