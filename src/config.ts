@@ -5,6 +5,7 @@ import { McpServerConfig } from "./mcp/client";
 const SECRET_KEY = "lunacode.openrouter.apiKey";
 
 export interface LunaCodeConfig {
+  costProfile: "custom" | "economy" | "balanced" | "quality";
   model: string;
   baseUrl: string;
   defaultMode: AgentMode;
@@ -41,6 +42,9 @@ export interface LunaCodeConfig {
   /** Reveal each edited file in a preview tab as the agent writes it. */
   revealEditedFiles: boolean;
   worktreeMode: boolean;
+  verificationPolicy: "advisory" | "standard" | "strict";
+  testFirstFixes: boolean;
+  durableQueue: boolean;
   customCommands: Record<string, string>;
   autoApproveCommands: string[];
   alwaysDenyCommands: string[];
@@ -60,6 +64,7 @@ export function getConfig(): LunaCodeConfig {
   const c = vscode.workspace.getConfiguration("lunacode");
   const mode = c.get<string>("defaultMode", "standard");
   return {
+    costProfile: parseCostProfile(c.get<string>("costProfile", "custom")),
     model: c.get<string>("model", "z-ai/glm-5.2"),
     baseUrl: c.get<string>("baseUrl", "https://openrouter.ai/api/v1").replace(/\/$/, ""),
     defaultMode: isMode(mode) ? mode : "standard",
@@ -75,7 +80,7 @@ export function getConfig(): LunaCodeConfig {
     implementerModel: c.get<string>("implementerModel", "").trim(),
     subagentMaxContextTokens: Math.max(
       8_000,
-      Math.floor(c.get<number>("subagentMaxContextTokens", 60_000) || 60_000)
+      Math.floor(c.get<number>("subagentMaxContextTokens", 32_000) || 32_000)
     ),
     progressiveTools: c.get<boolean>("progressiveTools", true),
     adaptiveReasoning: c.get<boolean>("adaptiveReasoning", true),
@@ -89,6 +94,9 @@ export function getConfig(): LunaCodeConfig {
     formatAfterEdit: c.get<boolean>("formatAfterEdit", false),
     revealEditedFiles: c.get<boolean>("revealEditedFiles", false),
     worktreeMode: c.get<boolean>("worktreeMode", false),
+    verificationPolicy: parseVerificationPolicy(c.get<string>("verificationPolicy", "standard")),
+    testFirstFixes: c.get<boolean>("testFirstFixes", true),
+    durableQueue: c.get<boolean>("durableQueue", true),
     customCommands: c.get<Record<string, string>>("customCommands", {}) ?? {},
     autoApproveCommands: c.get<string[]>("autoApproveCommands", []),
     alwaysDenyCommands: c.get<string[]>("alwaysDenyCommands", []),
@@ -99,6 +107,14 @@ export function getConfig(): LunaCodeConfig {
     favoriteModels: (c.get<string[]>("favoriteModels", []) ?? []).filter(Boolean),
     mcpServers: c.get<Record<string, McpServerConfig>>("mcpServers", {}) ?? {},
   };
+}
+
+function parseVerificationPolicy(v: string): "advisory" | "standard" | "strict" {
+  return v === "advisory" || v === "strict" ? v : "standard";
+}
+
+function parseCostProfile(v: string): "custom" | "economy" | "balanced" | "quality" {
+  return v === "economy" || v === "balanced" || v === "quality" ? v : "custom";
 }
 
 function clamp(n: number, lo: number, hi: number, fallback: number): number {

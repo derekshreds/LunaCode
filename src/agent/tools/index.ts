@@ -12,6 +12,7 @@ import { askUserTool } from "./askUser";
 import { updateMemoryTool } from "./memoryTool";
 import { implementTool } from "./implement";
 import { findSymbolTool } from "./findSymbol";
+import { tournamentTool } from "./tournament";
 
 export * from "./types";
 
@@ -31,6 +32,7 @@ export const ALL_TOOLS: Tool[] = [
   readProcessTool,
   // meta
   exploreTool,
+  tournamentTool,
   setTasksTool,
   updateMemoryTool,
   askUserTool,
@@ -54,6 +56,7 @@ for (const t of ALL_TOOLS) {
       t.group = "edit";
     } else if (
       t.name === "explore" ||
+      t.name === "tournament" ||
       t.name === "set_tasks" ||
       t.name === "update_memory" ||
       t.name === "ask_user" ||
@@ -77,13 +80,16 @@ export function toolsForSubagent(): Tool[] {
     (t) =>
       !t.mutating &&
       t.name !== "explore" &&
+      t.name !== "tournament" &&
       t.name !== "set_tasks" &&
       t.name !== "ask_user" &&
       t.name !== "implement" &&
       t.name !== "update_memory" &&
       // Niche tools — schema tax not worth it for research digests.
       t.name !== "read_process" &&
-      t.name !== "get_diagnostics"
+      t.name !== "get_diagnostics" &&
+      t.name !== "git_status" &&
+      t.name !== "git_log"
   );
 }
 
@@ -95,12 +101,17 @@ export function toolsForImplementer(): Tool[] {
   return ALL_TOOLS.filter(
     (t) =>
       t.name !== "explore" &&
+      t.name !== "tournament" &&
       t.name !== "implement" &&
       t.name !== "ask_user" &&
       t.name !== "set_tasks" &&
       t.name !== "start_process" &&
       t.name !== "stop_process" &&
-      t.name !== "read_process"
+      t.name !== "read_process" &&
+      t.name !== "update_memory" &&
+      t.name !== "git_status" &&
+      t.name !== "git_diff" &&
+      t.name !== "git_log"
   );
 }
 
@@ -113,11 +124,17 @@ export type ToolPhase = "read" | "edit" | "all";
 
 export function toolsForPhase(planMode: boolean, phase: ToolPhase): Tool[] {
   const base = toolsForMode(planMode);
-  if (planMode || phase === "all") return base;
+  if (phase === "all") return base;
   if (phase === "read") {
     // Research + orchestration, no file writes / shell.
-    return base.filter((t) => t.group === "read" || t.group === "meta");
+    return base.filter((t) =>
+      (t.group === "read" || t.group === "meta") &&
+      t.name !== "read_process" &&
+      // High-value but deliberately on-demand: don't tax every routine call.
+      t.name !== "tournament"
+    );
   }
+  if (planMode) return base;
   // edit: everything except heavy exec? Keep exec available once editing —
   // tests/builds are part of implement. "edit" phase = full non-plan set.
   return base;

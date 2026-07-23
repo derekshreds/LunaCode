@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as fsp from "fs/promises";
 import * as path from "path";
 import { Tool, ToolContext, ToolResult } from "./types";
-import { fileExists, resolveInWorkspace } from "./util";
+import { assertWriteScope, fileExists, fileRevision, resolveInWorkspace } from "./util";
 import { computeDiff } from "../../diff";
 import { planLineRangeReplace, planStringReplace } from "../editMatch";
 
@@ -42,13 +42,18 @@ export const writeFileTool: Tool = {
     properties: {
       path: { type: "string", description: "Workspace-relative path." },
       content: { type: "string", description: "Full file contents." },
+      expected_revision: { type: "string", description: "Revision from read_file; rejects stale overwrites (recommended for existing files)." },
     },
     required: ["path", "content"],
   },
   async execute(args, ctx): Promise<ToolResult> {
+    assertWriteScope(ctx, args.path);
     const abs = resolveInWorkspace(ctx.workspaceRoot, args.path);
     const existed = fileExists(abs);
     const before = existed ? await fsp.readFile(abs, "utf8").catch(() => "") : "";
+    if (existed && args.expected_revision && args.expected_revision !== fileRevision(before)) {
+      return { content: `Stale write rejected for ${args.path}: expected revision ${args.expected_revision}, current ${fileRevision(before)}. Re-read the file.`, isError: true };
+    }
     const diff = computeDiff(before, args.content, args.path);
 
     const decision = await ctx.requestApproval({
@@ -59,6 +64,11 @@ export const writeFileTool: Tool = {
     });
     if (decision === "rejected") {
       return { content: `User rejected writing ${args.path}.`, isError: true };
+    }
+
+    const latest = existed ? await fsp.readFile(abs, "utf8").catch(() => "") : null;
+    if ((existed && latest !== before) || (!existed && fileExists(abs))) {
+      return { content: `Concurrent change detected for ${args.path} while approval was pending. Re-read and retry.`, isError: true };
     }
 
     await writeFileContents(abs, args.content);
@@ -72,14 +82,21 @@ export const writeFileTool: Tool = {
 
 interface PatchChange {
   path: string;
-  edits?: Array<{ old_string: string; new_string: string; replace_all?: boolean }>;
+  expected_revision?: string;
+  edits?: Array<{
+    old_string?: string;
+    new_string: string;
+    replace_all?: boolean;
+    start_line?: number;
+    end_line?: number;
+  }>;
   content?: string;
 }
 
 export const applyPatchTool: Tool = {
   name: "apply_patch",
   description:
-    "Apply edits to MULTIPLE files in one call. Each change is old_string→new_string edits or full content.",
+    "Atomically preflight and apply edits to one or more files in one call. Each edit uses old_string→new_string or start_line+end_line+new_string; content creates/replaces a whole file.",
   mutating: true,
   group: "edit",
   parameters: {
@@ -91,6 +108,7 @@ export const applyPatchTool: Tool = {
           type: "object",
           properties: {
             path: { type: "string", description: "Workspace-relative path." },
+            expected_revision: { type: "string", description: "Revision from read_file; rejects stale edits." },
             edits: {
               type: "array",
               description: "Exact-string replacements.",
@@ -100,8 +118,16 @@ export const applyPatchTool: Tool = {
                   old_string: { type: "string" },
                   new_string: { type: "string" },
                   replace_all: { type: "boolean" },
+                  start_line: {
+                    type: "number",
+                    description: "1-based start line (use with end_line instead of old_string).",
+                  },
+                  end_line: {
+                    type: "number",
+                    description: "1-based inclusive end line.",
+                  },
                 },
-                required: ["old_string", "new_string"],
+                required: ["new_string"],
               },
             },
             content: {
@@ -112,11 +138,16 @@ export const applyPatchTool: Tool = {
           required: ["path"],
         },
       },
+      atomic: {
+        type: "boolean",
+        description: "Abort before writing if any change is invalid (default true). Set false only to allow valid files through.",
+      },
     },
     required: ["changes"],
   },
   async execute(args, ctx): Promise<ToolResult> {
     const changes: PatchChange[] = Array.isArray(args.changes) ? args.changes : [];
+    const atomic = args.atomic !== false;
     if (!changes.length) {
       return { content: "apply_patch requires a non-empty changes array.", isError: true };
     }
@@ -132,7 +163,23 @@ export const applyPatchTool: Tool = {
       error?: string;
     };
     const prepared: Prepared[] = [];
+    const seenPaths = new Set<string>();
     for (const change of changes) {
+      if (!change || typeof change.path !== "string" || !change.path.trim()) {
+        prepared.push({ change: change ?? { path: "(missing)" }, abs: "", before: "", after: "", existed: false, replacements: 0, error: "path is required" });
+        continue;
+      }
+      try {
+        assertWriteScope(ctx, change.path);
+      } catch (e: any) {
+        prepared.push({ change, abs: "", before: "", after: "", existed: false, replacements: 0, error: e.message });
+        continue;
+      }
+      if (seenPaths.has(change.path)) {
+        prepared.push({ change, abs: "", before: "", after: "", existed: false, replacements: 0, error: "duplicate path; combine edits into one change" });
+        continue;
+      }
+      seenPaths.add(change.path);
       let abs: string;
       try {
         abs = resolveInWorkspace(ctx.workspaceRoot, change.path);
@@ -142,6 +189,10 @@ export const applyPatchTool: Tool = {
       }
       const existed = fileExists(abs);
       const before = existed ? await fsp.readFile(abs, "utf8").catch(() => "") : "";
+      if (existed && change.expected_revision && change.expected_revision !== fileRevision(before)) {
+        prepared.push({ change, abs, before, after: before, existed, replacements: 0, error: `stale revision (expected ${change.expected_revision}, current ${fileRevision(before)}); re-read the file` });
+        continue;
+      }
       if (typeof change.content === "string") {
         prepared.push({ change, abs, before, after: change.content, existed, replacements: 0 });
         continue;
@@ -158,7 +209,22 @@ export const applyPatchTool: Tool = {
       let replacements = 0;
       let error: string | undefined;
       for (const e of change.edits) {
-        const plan = planStringReplace(text, e.old_string, e.new_string, !!e.replace_all);
+        const useLines =
+          e.start_line != null &&
+          e.end_line != null &&
+          Number.isFinite(Number(e.start_line)) &&
+          Number.isFinite(Number(e.end_line));
+        if (typeof e.new_string !== "string") {
+          error = "each edit requires new_string";
+          break;
+        }
+        if (!useLines && (typeof e.old_string !== "string" || !e.old_string.length)) {
+          error = "each edit requires old_string or start_line+end_line";
+          break;
+        }
+        const plan = useLines
+          ? planLineRangeReplace(text, Number(e.start_line), Number(e.end_line), e.new_string)
+          : planStringReplace(text, e.old_string!, e.new_string, !!e.replace_all);
         if (!plan.ok) {
           error = plan.reason;
           break;
@@ -170,11 +236,14 @@ export const applyPatchTool: Tool = {
     }
 
     const valid = prepared.filter((p) => !p.error);
-    if (!valid.length) {
+    const invalid = prepared.filter((p) => p.error);
+    if (!valid.length || (atomic && invalid.length)) {
       return {
         content:
-          "apply_patch: no file could be applied:\n" +
-          prepared.map((p) => `✗ ${p.change.path}: ${p.error}`).join("\n"),
+          `apply_patch: ${atomic && valid.length ? "atomic preflight failed; no files were changed" : "no file could be applied"}:\n` +
+          prepared
+            .map((p) => p.error ? `✗ ${p.change.path}: ${p.error}` : `✓ ${p.change.path}: preflight passed`)
+            .join("\n"),
         isError: true,
       };
     }
@@ -194,7 +263,21 @@ export const applyPatchTool: Tool = {
       return { content: "User rejected the patch.", isError: true };
     }
 
+    // Approval can stay open while the user or another process edits files.
+    // Revalidate the complete batch immediately before the first write.
+    for (const p of valid) {
+      const existsNow = fileExists(p.abs);
+      const latest = existsNow ? await fsp.readFile(p.abs, "utf8").catch(() => "") : "";
+      if (existsNow !== p.existed || (p.existed && latest !== p.before)) {
+        return {
+          content: `apply_patch: concurrent change detected for ${p.change.path} after preflight; no files were changed. Re-read and retry.`,
+          isError: true,
+        };
+      }
+    }
+
     const lines: string[] = [];
+    const applied: Prepared[] = [];
     for (const p of prepared) {
       if (p.error) {
         lines.push(`✗ ${p.change.path}: ${p.error}`);
@@ -202,6 +285,7 @@ export const applyPatchTool: Tool = {
       }
       try {
         await writeFileContents(p.abs, p.after);
+        applied.push(p);
         lines.push(
           typeof p.change.content === "string"
             ? `✓ ${p.change.path} (${p.existed ? "overwrote" : "created"})`
@@ -209,11 +293,35 @@ export const applyPatchTool: Tool = {
         );
       } catch (e: any) {
         lines.push(`✗ ${p.change.path}: ${e.message}`);
+        if (atomic) {
+          const rollbackErrors: string[] = [];
+          for (const done of [...applied].reverse()) {
+            try {
+              if (done.existed) await writeFileContents(done.abs, done.before);
+              else await fsp.rm(done.abs, { force: true });
+            } catch (rollbackError: any) {
+              rollbackErrors.push(`${done.change.path}: ${rollbackError?.message ?? rollbackError}`);
+            }
+          }
+          return {
+            content:
+              `apply_patch: write failed; rolled back ${applied.length} file(s).\n${lines.join("\n")}` +
+              (rollbackErrors.length ? `\nRollback errors:\n${rollbackErrors.join("\n")}` : ""),
+            isError: true,
+            ui: { diff: biggest, files: 0, skipped: invalid.length },
+          };
+        }
       }
     }
     return {
-      content: `Applied patch:\n${lines.join("\n")}`,
-      ui: { diff: biggest, files: valid.length },
+      content: `Applied patch (${atomic ? "atomic preflight" : "partial mode"}):\n${lines.join("\n")}`,
+      isError: applied.length === 0,
+      ui: {
+        diff: biggest,
+        diffs: applied.map((p) => computeDiff(p.before, p.after, p.change.path)),
+        files: applied.length,
+        skipped: invalid.length,
+      },
     };
   },
 };
@@ -246,16 +354,21 @@ export const editFileTool: Tool = {
         type: "number",
         description: "1-based inclusive end for line-range replace.",
       },
+      expected_revision: { type: "string", description: "Revision from read_file; rejects stale edits." },
     },
     required: ["path", "new_string"],
   },
   async execute(args, ctx): Promise<ToolResult> {
+    assertWriteScope(ctx, args.path);
     const abs = resolveInWorkspace(ctx.workspaceRoot, args.path);
     let before: string;
     try {
       before = await fsp.readFile(abs, "utf8");
     } catch (e: any) {
       return { content: `Cannot edit ${args.path}: ${e.message}`, isError: true };
+    }
+    if (args.expected_revision && args.expected_revision !== fileRevision(before)) {
+      return { content: `Stale edit rejected for ${args.path}: expected revision ${args.expected_revision}, current ${fileRevision(before)}. Re-read the file.`, isError: true };
     }
 
     const newString = typeof args.new_string === "string" ? args.new_string : "";
@@ -295,6 +408,11 @@ export const editFileTool: Tool = {
     });
     if (decision === "rejected") {
       return { content: `User rejected editing ${args.path}.`, isError: true };
+    }
+
+    const latest = await fsp.readFile(abs, "utf8").catch(() => "");
+    if (latest !== before) {
+      return { content: `Concurrent change detected for ${args.path} while approval was pending. Re-read and retry.`, isError: true };
     }
 
     await writeFileContents(abs, plan.after);

@@ -42,6 +42,8 @@ export interface OpenRouterClientOptions {
  * starts, and mid-stream provider stalls before any content has streamed. */
 const MAX_ATTEMPTS = 3;
 const RETRY_BASE_MS = 1000;
+/** Generation records are finalized asynchronously after a stream closes. */
+const GENERATION_COST_RETRY_DELAYS_MS = [0, 250, 500, 1000, 2000];
 /** Abort a stream that produces no DATA frames for this long. Keepalive
  * comments (": OPENROUTER PROCESSING") don't count — OpenRouter keeps
  * sending them while an upstream provider is stalled, so a byte-level
@@ -159,7 +161,8 @@ export class OpenRouterClient {
   async fetchGenerationCost(
     id: string
   ): Promise<{ prompt_tokens: number; completion_tokens: number; cost: number; cachedTokens: number } | null> {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (const delayMs of GENERATION_COST_RETRY_DELAYS_MS) {
+      if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
       try {
         const res = await fetch(`${this.opts.baseUrl}/generation?id=${encodeURIComponent(id)}`, {
           headers: this.headers(),
@@ -178,7 +181,6 @@ export class OpenRouterClient {
       } catch {
         /* transient — retry */
       }
-      await new Promise((r) => setTimeout(r, 500));
     }
     return null;
   }
@@ -306,6 +308,12 @@ export class OpenRouterClient {
         }
         continue;
       }
+
+      // OpenRouter returns this header as soon as the request is accepted.
+      // Capture it before reading the body so cancellation can still recover
+      // authoritative usage when no SSE chunk (or final usage frame) arrives.
+      const headerGenId = res.headers.get("X-Generation-Id");
+      if (headerGenId) this.lastGenId = headerGenId;
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();

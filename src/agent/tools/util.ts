@@ -2,6 +2,32 @@ import * as path from "path";
 import * as fs from "fs";
 import type { ToolContext, ToolResult } from "./types";
 
+/** Stable, compact content revision used for optimistic edit concurrency. */
+export function fileRevision(content: string | Buffer): string {
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
+  let h = 0x811c9dc5;
+  for (const byte of buf) {
+    h ^= byte;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `${buf.length.toString(36)}-${h.toString(36)}`;
+}
+
+/** Enforce the path declaration attached to a write-capable sub-agent. */
+export function assertWriteScope(ctx: ToolContext, candidate: string): void {
+  if (!ctx.writeScope?.length) return;
+  const clean = candidate.replace(/\\/g, "/").replace(/^\.\//, "");
+  const allowed = ctx.writeScope.some((raw) => {
+    const scope = raw.replace(/\\/g, "/").replace(/^\.\//, "");
+    if (scope.endsWith("/**")) return clean.startsWith(scope.slice(0, -2));
+    if (scope.endsWith("/")) return clean.startsWith(scope);
+    return clean === scope;
+  });
+  if (!allowed) {
+    throw new Error(`Write outside delegated scope: ${candidate}. Allowed: ${ctx.writeScope.join(", ")}`);
+  }
+}
+
 /** Short-circuit if an identical live tool result is already in context —
  * replaces a multi-KB repeat with a one-line pointer, for the whole session
  * (unlike the 30s read cache). Works for any read-only tool. */
@@ -197,4 +223,22 @@ export function readCacheInvalidate(path?: string): void {
  */
 export function readCacheInvalidatePath(path: string): void {
   readCacheInvalidate(path)
+}
+
+/** Files that commonly contain credentials require a dedicated approval even
+ * though reading is otherwise non-mutating. */
+export function isSensitivePath(filePath: string): boolean {
+  const base = filePath.replace(/\\/g, "/").split("/").pop()?.toLowerCase() ?? "";
+  return /^\.env(?:\.|$)/.test(base) ||
+    /^(?:id_rsa|id_ed25519|credentials\.json|secrets?\.(?:json|ya?ml|toml))$/.test(base) ||
+    /\.(?:pem|key|p12|pfx|keystore)$/.test(base);
+}
+
+/** Best-effort defense against credentials being echoed into model context,
+ * receipts, or the webview by command output. */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/\b(?:sk|ghp|github_pat|xox[baprs])-[-A-Za-z0-9_]{16,}\b/g, "[REDACTED_TOKEN]")
+    .replace(/((?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)\s*[:=]\s*)[^\s"']+/gi, "$1[REDACTED]")
+    .replace(/(authorization:\s*(?:bearer|basic)\s+)[^\s]+/gi, "$1[REDACTED]");
 }

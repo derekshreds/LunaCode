@@ -1,4 +1,5 @@
 import { Tool, ToolResult } from "./types";
+import { canRunJobsInParallel, combineSubagentReports, DelegatedJob } from "../delegation";
 
 /**
  * Delegates a bounded implementation task to a disposable write-capable
@@ -14,7 +15,7 @@ import { Tool, ToolResult } from "./types";
 export const implementTool: Tool = {
   name: "implement",
   description:
-    "Delegate a self-contained implementation task to a write-capable sub-agent. Returns a summary of what changed. Pass tasks (array) for parallel independent sub-tasks (max 3). Not available in Plan mode.",
+    "Delegate implementation to a write-capable sub-agent. Use jobs with declared paths for conflict-safe parallel work; unscoped tasks are serialized. Returns changes, tests, cost, and evidence. Not available in Plan mode.",
   mutating: true,
   parameters: {
     type: "object",
@@ -24,11 +25,28 @@ export const implementTool: Tool = {
         description:
           "Concrete task with enough context (files, approach, constraints).",
       },
+      paths: {
+        type: "array",
+        items: { type: "string" },
+        description: "Optional write scope for a single task; directory scopes end with /.",
+      },
       tasks: {
         type: "array",
         items: { type: "string" },
         description:
           "Independent implementation tasks to run in parallel (max 3). Each task gets its own write-capable sub-agent.",
+      },
+      jobs: {
+        type: "array",
+        description: "Scoped implementation jobs (max 3). Disjoint path sets run in parallel; overlapping or missing scopes run serially.",
+        items: {
+          type: "object",
+          properties: {
+            task: { type: "string", description: "Concrete implementation task." },
+            paths: { type: "array", items: { type: "string" }, description: "Only files this job may write; directory scopes end with /." },
+          },
+          required: ["task", "paths"],
+        },
       },
     },
   },
@@ -42,14 +60,26 @@ export const implementTool: Tool = {
     }
 
     // Normalize to a list of tasks.  Prefer `tasks` when both are set.
-    const list: string[] = [];
-    if (Array.isArray(args.tasks)) {
+    const list: DelegatedJob[] = [];
+    if (Array.isArray(args.jobs)) {
+      for (const job of args.jobs) {
+        if (typeof job?.task === "string" && job.task.trim()) {
+          list.push({
+            task: job.task.trim(),
+            paths: Array.isArray(job.paths)
+              ? job.paths.filter((p: unknown) => typeof p === "string" && p.trim()).map((p: string) => p.trim())
+              : undefined,
+          });
+        }
+      }
+    }
+    if (!list.length && Array.isArray(args.tasks)) {
       for (const t of args.tasks) {
-        if (typeof t === "string" && t.trim()) list.push(t.trim());
+        if (typeof t === "string" && t.trim()) list.push({ task: t.trim() });
       }
     }
     if (!list.length && typeof args.task === "string" && args.task.trim()) {
-      list.push(args.task.trim());
+      list.push({ task: args.task.trim(), paths: Array.isArray(args.paths) ? args.paths : undefined });
     }
     if (!list.length) {
       return {
@@ -60,23 +90,29 @@ export const implementTool: Tool = {
 
     // Cap fan-out so a runaway model can't spawn dozens of sub-agents.
     const MAX_PARALLEL = 3;
-    const tasks = list.slice(0, MAX_PARALLEL);
+    const jobs = list.slice(0, MAX_PARALLEL);
     const truncated = list.length > MAX_PARALLEL;
+    const estimate = ctx.estimateDelegation?.("implementation", jobs.length);
+    if (estimate) ctx.emitOutput?.(
+      `Cost ceiling: ${jobs.length} × ${estimate.maxContextTokens.toLocaleString()} tokens on ${estimate.model}` +
+      (estimate.estimatedCost != null ? ` ≈ $${estimate.estimatedCost.toFixed(4)}` : "") + "\n"
+    );
 
     // Single task: request approval once, then run.
-    if (tasks.length === 1) {
+    if (jobs.length === 1) {
+      const job = jobs[0];
       const decision = await ctx.requestApproval({
         kind: "implement",
         title: "Run implementer sub-agent",
-        subject: tasks[0].slice(0, 200) + (tasks[0].length > 200 ? "…" : ""),
-        detail: "A disposable sub-agent will edit files to complete this task.",
+        subject: job.task.slice(0, 200) + (job.task.length > 200 ? "…" : ""),
+        detail: job.paths?.length ? `Write scope: ${job.paths.join(", ")}` : "A disposable sub-agent will edit files to complete this task.",
       });
       if (decision === "rejected") {
         return { content: "User rejected the implementer sub-agent.", isError: true };
       }
       try {
-        const summary = await ctx.implement(tasks[0]);
-        return { content: summary };
+        const result = await ctx.implement(job);
+        return { content: result.summary, ui: { report: result.report } };
       } catch (e: any) {
         return { content: `Implementer failed: ${e?.message ?? e}`, isError: true };
       }
@@ -84,14 +120,15 @@ export const implementTool: Tool = {
 
     // Parallel orchestration: each task runs in its own sub-agent context.
     // Request a single approval covering all sub-tasks.
+    const parallel = canRunJobsInParallel(jobs);
     const decision = await ctx.requestApproval({
       kind: "implement",
-      title: `Run ${tasks.length} implementer sub-agents in parallel`,
-      subject: `${tasks.length} implementation tasks`,
-      detail: tasks
+      title: `Run ${jobs.length} implementer sub-agents ${parallel ? "in parallel" : "safely in sequence"}`,
+      subject: `${jobs.length} implementation tasks`,
+      detail: jobs
         .map(
-          (t, i) =>
-            `${i + 1}. ${t.slice(0, 120)}${t.length > 120 ? "…" : ""}`,
+          (job, i) =>
+            `${i + 1}. ${job.task.slice(0, 120)}${job.task.length > 120 ? "…" : ""}${job.paths?.length ? `\n   paths: ${job.paths.join(", ")}` : "\n   paths: unscoped → serialized"}`,
         )
         .join("\n"),
     });
@@ -100,34 +137,41 @@ export const implementTool: Tool = {
     }
 
     ctx.emitOutput?.(
-      `Orchestrating ${tasks.length} implementer sub-agents in parallel…\n`,
+      `Orchestrating ${jobs.length} implementer sub-agents ${parallel ? "in parallel with disjoint write scopes" : "sequentially to prevent write conflicts"}…\n`,
     );
-    const results = await Promise.all(
-      tasks.map(async (t, i) => {
+    const runJob = async (job: DelegatedJob, i: number) => {
         ctx.emitOutput?.(
-          `[${i + 1}/${tasks.length}] ${t.slice(0, 80)}${t.length > 80 ? "…" : ""}\n`,
+          `[${i + 1}/${jobs.length}] ${job.task.slice(0, 80)}${job.task.length > 80 ? "…" : ""}\n`,
         );
         try {
-          const summary = await ctx.implement!(t);
-          return { t, summary, ok: true as const };
+          const result = await ctx.implement!(job);
+          return { t: job.task, result, ok: true as const };
         } catch (e: any) {
           return {
-            t,
-            summary: `Implementer failed: ${e?.message ?? e}`,
+            t: job.task,
+            result: undefined,
+            error: `Implementer failed: ${e?.message ?? e}`,
             ok: false as const,
           };
         }
-      }),
-    );
+    };
+    const results: Array<Awaited<ReturnType<typeof runJob>>> = [];
+    if (parallel) results.push(...await Promise.all(jobs.map(runJob)));
+    else for (let i = 0; i < jobs.length; i++) results.push(await runJob(jobs[i], i));
 
     const parts = results.map((r, i) => {
       const header = `## Implementation ${i + 1}: ${r.t}`;
-      return `${header}\n\n${r.summary}`;
+      return `${header}\n\n${r.result?.summary ?? r.error}`;
     });
     let content = parts.join("\n\n---\n\n");
     if (truncated) {
-      content += `\n\n(Note: ${list.length - MAX_PARALLEL} additional task(s) were dropped — max ${MAX_PARALLEL} parallel implementers.)`;
+      content += `\n\n(Note: ${list.length - MAX_PARALLEL} additional task(s) were dropped — max ${MAX_PARALLEL} implementers.)`;
     }
-    return { content };
+    const completed = results.flatMap((r) => (r.result ? [r.result] : []));
+    return {
+      content,
+      ...(completed.length ? { ui: { report: combineSubagentReports("implementation", completed) } } : {}),
+      isError: completed.length === 0,
+    };
   },
 };

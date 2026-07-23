@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { AgentMode } from "../../modes";
 import { DiffData } from "../../webview/protocol";
+import type { ToolReport } from "../../webview/protocol";
 import type { StickyMemory } from "../stickyMemory";
 import type { ContextManager } from "../contextManager";
 
@@ -26,6 +27,8 @@ export interface ApprovalRequest {
 export interface ToolContext {
   workspaceRoot: string;
   mode: AgentMode;
+  /** True inside disposable subagents; used to deny interactive-only capabilities. */
+  delegated?: boolean;
   /** Request user approval for a side-effecting action. */
   requestApproval(req: ApprovalRequest): Promise<ApprovalDecision>;
   /** Emit a streaming status/log line to the UI. */
@@ -39,12 +42,14 @@ export interface ToolContext {
    * digest. Injected by the main Agent only — absent inside sub-agents, so
    * explore can never recurse.
    */
-  explore?(question: string): Promise<string>;
+  explore?(question: string): Promise<SubagentRunResult>;
+  /** Run two independent candidate analyses for the parent model to judge. */
+  tournament?(question: string): Promise<SubagentRunResult>;
   /**
    * Run a bounded implementation task in a disposable write-capable sub-agent.
    * Absent in Plan mode and inside sub-agents.
    */
-  implement?(task: string): Promise<string>;
+  implement?(request: { task: string; paths?: string[] }): Promise<SubagentRunResult>;
   /**
    * Ask the user a clarifying question and wait for their answer.
    * Injected by the main Agent; absent inside sub-agents.
@@ -72,6 +77,22 @@ export interface ToolContext {
     at: number;
     pathsHint?: string[];
   };
+  /** Optional workspace-relative paths this implementer may modify. Directory
+   * scopes end in `/`; omitted means the parent agent owns write safety. */
+  writeScope?: string[];
+  /** Estimate the upper-bound input cost of delegated work. */
+  estimateDelegation?(kind: "research" | "implementation", agents: number): {
+    model: string;
+    maxContextTokens: number;
+    estimatedCost?: number;
+  };
+}
+
+/** Result returned by a disposable sub-agent. `summary` is model-visible;
+ * `report` is rendered only in the UI. */
+export interface SubagentRunResult {
+  summary: string;
+  report: ToolReport;
 }
 
 export interface ToolResult {

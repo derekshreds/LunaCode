@@ -1,5 +1,7 @@
 // Message protocol shared between the extension host and the webview UI.
 import { AgentMode } from "../modes";
+import type { ControlCenterSnapshot } from "../controlCenter";
+export type { ControlCenterSnapshot } from "../controlCenter";
 
 // Structured side-by-side diff (git-style). Computed in the extension, rendered
 // with line numbers + syntax highlighting in the webview.
@@ -96,6 +98,43 @@ export interface TaskItem {
   status: "pending" | "active" | "done";
 }
 
+/** Compact, UI-only telemetry for delegated work. It is deliberately kept out
+ * of the model-visible tool result so better observability has no context-tax. */
+export interface ToolReport {
+  kind: "research" | "implementation";
+  agents: number;
+  successful: number;
+  iterations: number;
+  toolCalls: number;
+  durationMs: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  cost?: number;
+  tools: { name: string; count: number }[];
+  sources: string[];
+  /** Original delegated objective, retained only in UI/session evidence. */
+  task?: string;
+}
+
+/** Persisted end-of-turn evidence. Unlike transient tool cards, receipts are
+ * restored with session history and remain useful after compaction/reload. */
+export interface TurnReceipt {
+  id: number;
+  startedAt: number;
+  endedAt: number;
+  model: string;
+  stopReason: string;
+  toolCalls: number;
+  files: { path: string; added: number; removed: number }[];
+  commands: { command: string; ok: boolean; summary: string }[];
+  subagents: ToolReport[];
+  evidence: string[];
+  failures: string[];
+  usage: UsagePayload;
+  schemaTokens?: number;
+}
+
 /** An @-mention completion. `file`/`folder`/`symbol` insert `insert` text into
  * the composer; `problems`/`git` are resolved host-side into attached context. */
 export interface MentionItem {
@@ -127,6 +166,7 @@ export interface ContextInfo {
 
 /** All GUI-editable settings, mirroring the lunacode.* configuration keys. */
 export interface SettingsPayload {
+  costProfile: "custom" | "economy" | "balanced" | "quality";
   model: string;
   summarizerModel: string;
   subagentModel: string;
@@ -157,6 +197,9 @@ export interface SettingsPayload {
   formatAfterEdit: boolean;
   revealEditedFiles: boolean;
   worktreeMode: boolean;
+  verificationPolicy: "advisory" | "standard" | "strict";
+  testFirstFixes: boolean;
+  durableQueue: boolean;
   autoApproveCommands: string[];
   alwaysDenyCommands: string[];
   baseUrl: string;
@@ -198,6 +241,8 @@ export type HostToWebview =
       ok: boolean;
       summary: string;
       diff?: DiffData;
+      diffs?: DiffData[];
+      report?: ToolReport;
     }
   | { type: "status"; message: string }
   /** Queued messages were applied as steering — clear their "Queued" tags. */
@@ -205,6 +250,7 @@ export type HostToWebview =
   | { type: "usage"; usage: UsagePayload }
   | { type: "error"; message: string }
   | { type: "turnEnd"; stopReason: string }
+  | { type: "turnReceipt"; receipt: TurnReceipt }
   | { type: "approvalRequest"; payload: ApprovalPayload }
   /** Clarifying question from the ask_user tool. */
   | {
@@ -227,6 +273,7 @@ export type HostToWebview =
   | { type: "taskList"; tasks: TaskItem[] }
   | { type: "turnDiff"; diffs: DiffData[] }
   | { type: "contextInfo"; info: ContextInfo }
+  | { type: "controlCenter"; snapshot: ControlCenterSnapshot }
   | { type: "mentionMatches"; token: number; items: MentionItem[] }
   /** Remove the last user message and everything after it from the transcript. */
   | { type: "rollback" }
@@ -272,6 +319,7 @@ export type WebviewToHost =
   | { type: "deleteSession"; id: string }
   | { type: "getUsage"; days: number }
   | { type: "getSettings" }
+  | { type: "applyCostProfile"; profile: "economy" | "balanced" | "quality" }
   | {
       type: "updateSetting";
       key: keyof SettingsPayload;
@@ -286,6 +334,14 @@ export type WebviewToHost =
   /** Open a native side-by-side editor diff (pre-turn ↔ current) for a file. */
   | { type: "openDiff"; path: string }
   | { type: "getContextInfo" }
+  | { type: "getControlCenter" }
+  | { type: "pauseQueue"; paused: boolean }
+  | { type: "removeQueued"; id: string }
+  | { type: "resumeRecovery" }
+  | { type: "discardRecovery" }
+  | { type: "mergeSandbox" }
+  | { type: "discardSandbox" }
+  | { type: "retryGraphNode"; prompt: string }
   | { type: "retryTurn" }
   | { type: "editLastTurn" }
   /** Retry the last turn after switching to a specific (fallback) model. */

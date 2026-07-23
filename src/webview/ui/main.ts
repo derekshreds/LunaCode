@@ -11,9 +11,12 @@ import {
   DailyPoint,
   ModelPoint,
   MentionItem,
+  ToolReport,
+  ControlCenterSnapshot,
 } from "../protocol";
 import { renderMarkdown } from "./markdown";
 import { highlightLine, escapeHtml } from "./highlight";
+import { appendTurnReceipt } from "./receipt";
 
 declare function acquireVsCodeApi(): {
   postMessage(msg: unknown): void;
@@ -53,6 +56,7 @@ let currentAssistant: { el: HTMLElement; raw: string; renderQueued?: boolean } |
 let currentReasoning: { details: HTMLDetailsElement; body: HTMLElement; raw: string } | null = null;
 /** Model driving the current turn — stamped onto each assistant block as a badge. */
 let currentTurnModel = "";
+let currentActivityPhase = "";
 
 // Thinking state machine
 let thinkStart = 0;
@@ -66,6 +70,10 @@ let usageDays = 30;
 /** True while the user wants the settings sheet open — settingsData messages
  * also arrive unsolicited (config-change broadcasts) and must not open it. */
 let settingsWanted = false;
+/** Control Center live refresh state. A single timer/request prevents manual
+ * refreshes and slow host snapshots from multiplying polling loops. */
+let controlCenterRefreshTimer: number | undefined;
+let controlCenterRefreshPending = false;
 /** Timestamp of the last provider usage event — proxy for "the provider's
  * prompt cache was just written". Typical cache TTL is ~5 minutes. */
 let lastUsageAt = 0;
@@ -108,15 +116,16 @@ app.innerHTML = `
       <span class="brand-name">Luna Code</span>
     </div>
     <div class="header-actions">
-      <button id="modelBtn" class="model-chip" title="Change model"></button>
-      <button id="usageBtn" class="icon-btn" title="Usage & cost"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M4 20V10M10 20V4M16 20v-7M20 20H3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-      <button id="historyBtn" class="icon-btn" title="Session history"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 7v5l3 2M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-      <button id="settingsBtn" class="icon-btn" title="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.12-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.65 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01A1.7 1.7 0 0 0 10.05 3V3a2 2 0 1 1 4 0v.09c0 .68.4 1.29 1.03 1.56a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01c.27.62.88 1.03 1.56 1.03H21a2 2 0 1 1 0 4h-.09c-.68 0-1.29.4-1.56 1.03z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
-      <button id="newBtn" class="icon-btn" title="New session"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+      <button id="modelBtn" class="model-chip" title="Change model" aria-label="Change model"></button>
+      <button id="usageBtn" class="icon-btn" title="Usage & cost" aria-label="Usage and cost"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M4 20V10M10 20V4M16 20v-7M20 20H3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <button id="controlBtn" class="icon-btn" title="Control Center" aria-label="Open Control Center"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h7M15 17h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="16" cy="7" r="2" stroke="currentColor"/><circle cx="8" cy="12" r="2" stroke="currentColor"/><circle cx="13" cy="17" r="2" stroke="currentColor"/></svg></button>
+      <button id="historyBtn" class="icon-btn" title="Session history" aria-label="Session history"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 7v5l3 2M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <button id="settingsBtn" class="icon-btn" title="Settings" aria-label="Settings"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="currentColor" stroke-width="2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.12-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.65 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01A1.7 1.7 0 0 0 10.05 3V3a2 2 0 1 1 4 0v.09c0 .68.4 1.29 1.03 1.56a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01c.27.62.88 1.03 1.56 1.03H21a2 2 0 1 1 0 4h-.09c-.68 0-1.29.4-1.56 1.03z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <button id="newBtn" class="icon-btn" title="New session" aria-label="New session"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
     </div>
   </div>
   <div id="overlay" class="overlay hidden"></div>
-  <div id="messages" class="messages"></div>
+  <div id="messages" class="messages" role="log" aria-live="polite" aria-relevant="additions"></div>
   <div id="approval" class="approval-slot"></div>
   <div id="tasks" class="tasks hidden"></div>
   <div id="activity" class="activity hidden">
@@ -133,8 +142,8 @@ app.innerHTML = `
     <div class="input-shell">
       <div id="attach" class="attach hidden"></div>
       <div class="input-row">
-        <textarea id="input" rows="1" placeholder="Ask Luna Code to build, fix, or explain…  (Enter to send · Shift+Enter for newline)"></textarea>
-        <button id="sendBtn" class="send-btn" title="Send"></button>
+        <textarea id="input" rows="1" aria-label="Message Luna Code" placeholder="Ask Luna Code to build, fix, or explain…  (Enter to send · Shift+Enter for newline)"></textarea>
+        <button id="sendBtn" class="send-btn" title="Send" aria-label="Send message"></button>
       </div>
       <div class="composer-bar">
         <div id="modeBar" class="mode-bar"></div>
@@ -168,6 +177,7 @@ modelBtn.addEventListener("click", () => post({ type: "selectModel" }));
 $("newBtn").addEventListener("click", () => post({ type: "newSession" }));
 $("historyBtn").addEventListener("click", () => post({ type: "listSessions" }));
 $("usageBtn").addEventListener("click", () => post({ type: "getUsage", days: usageDays }));
+$("controlBtn").addEventListener("click", requestControlCenter);
 $("settingsBtn").addEventListener("click", () => {
   settingsWanted = true;
   post({ type: "getSettings" });
@@ -775,6 +785,7 @@ const VERBS: Record<string, [string, string]> = {
   file_outline: ["Outlining", "Outlined"],
   get_diagnostics: ["Checking diagnostics", "Checked diagnostics"],
   explore: ["Exploring", "Explored"],
+  implement: ["Delegating", "Delegated"],
   set_tasks: ["Planning", "Updated plan"],
   write_file: ["Writing", "Wrote"],
   edit_file: ["Editing", "Edited"],
@@ -826,7 +837,16 @@ function friendly(name: string, args: any): { verbs: [string, string]; target: s
         target = args.path ?? "workspace";
         break;
       case "explore":
-        target = typeof args.question === "string" ? args.question.slice(0, 80) : "";
+        target = Array.isArray(args.questions)
+          ? `${args.questions.length} research question(s)`
+          : typeof args.question === "string" ? args.question.slice(0, 80) : "";
+        break;
+      case "implement":
+        target = Array.isArray(args.jobs)
+          ? `${args.jobs.length} scoped implementation job(s)`
+          : Array.isArray(args.tasks)
+          ? `${args.tasks.length} implementation task(s)`
+          : typeof args.task === "string" ? args.task.slice(0, 80) : "";
         break;
       case "set_tasks":
         target = Array.isArray(args.tasks) ? `${args.tasks.length} step(s)` : "";
@@ -847,10 +867,23 @@ function friendly(name: string, args: any): { verbs: [string, string]; target: s
 }
 
 const toolCards = new Map<string, HTMLElement>();
+function activityPhase(name: string): string {
+  if (name === "set_tasks") return "Plan";
+  if (name === "explore") return "Research delegation";
+  if (name === "implement" || name === "write_file" || name === "edit_file" || name === "apply_patch") return "Implementation";
+  if (name === "run_command" || name === "get_diagnostics") return "Verification";
+  if (name.startsWith("git_")) return "Repository review";
+  return "Research";
+}
 function addToolStart(id: string, name: string, args: any) {
   currentAssistant = null;
   thinkCountEl.textContent = ""; // new step — counter restarts at 0
   const { verbs, target } = friendly(name, args);
+  const phase = activityPhase(name);
+  if (phase !== currentActivityPhase) {
+    messagesEl.appendChild(el("div", "phase-line", phase));
+    currentActivityPhase = phase;
+  }
   const row = el("div", "tool-row running");
   row.appendChild(el("span", "tool-dot"));
   row.appendChild(el("span", "tool-verb", verbs[0]));
@@ -861,7 +894,7 @@ function addToolStart(id: string, name: string, args: any) {
   toolCards.set(id, wrap);
   scrollToBottom();
 }
-function addToolEnd(id: string, name: string, ok: boolean, summary: string, diff?: DiffData) {
+function addToolEnd(id: string, name: string, ok: boolean, summary: string, diff?: DiffData, report?: ToolReport) {
   const wrap = toolCards.get(id);
   if (!wrap) return;
   const row = wrap.querySelector(".tool-row") as HTMLElement | null;
@@ -881,7 +914,54 @@ function addToolEnd(id: string, name: string, ok: boolean, summary: string, diff
   } else if (!ok && summary) {
     wrap.appendChild(el("div", "tool-error", summary));
   }
+  if (report) wrap.appendChild(renderToolReport(report));
+  toolCards.delete(id);
   scrollToBottom();
+}
+
+/** Rich sub-agent telemetry is UI-only: useful evidence for the user without
+ * adding a single token to the primary model's conversation. */
+function renderToolReport(report: ToolReport): HTMLElement {
+  const details = el("details", "tool-report") as HTMLDetailsElement;
+  const cacheHit = report.promptTokens > 0
+    ? Math.round((report.cachedTokens / report.promptTokens) * 100)
+    : 0;
+  const elapsed = report.durationMs < 1000
+    ? `${report.durationMs}ms`
+    : `${(report.durationMs / 1000).toFixed(report.durationMs < 10_000 ? 1 : 0)}s`;
+  const agents = report.agents === 1 ? "1 agent" : `${report.agents} agents`;
+  const headline = [
+    agents,
+    `${report.toolCalls} call${report.toolCalls === 1 ? "" : "s"}`,
+    `${fmtTokens(report.promptTokens + report.completionTokens)} tok`,
+    `${cacheHit}% cached`,
+    elapsed,
+    ...(report.cost != null ? [fmtCost(report.cost)] : []),
+  ].join(" · ");
+  details.appendChild(el("summary", "tool-report-summary", headline));
+
+  const body = el("div", "tool-report-body");
+  if (report.successful < report.agents) {
+    body.appendChild(el("div", "tool-report-warning", `${report.successful}/${report.agents} agents completed`));
+  }
+  if (report.tools.length) {
+    const tools = el("div", "tool-report-section");
+    tools.appendChild(el("span", "tool-report-label", "Tools"));
+    const chips = el("div", "tool-report-chips");
+    for (const tool of report.tools) chips.appendChild(el("span", "tool-report-chip", `${tool.name} ×${tool.count}`));
+    tools.appendChild(chips);
+    body.appendChild(tools);
+  }
+  if (report.sources.length) {
+    const sources = el("div", "tool-report-section");
+    sources.appendChild(el("span", "tool-report-label", report.kind === "implementation" ? "Files" : "Sources"));
+    const list = el("div", "tool-report-sources");
+    for (const source of report.sources) list.appendChild(el("div", "tool-report-source", source));
+    sources.appendChild(list);
+    body.appendChild(sources);
+  }
+  details.appendChild(body);
+  return details;
 }
 
 // ---------- Diff (split, git-style) ----------
@@ -994,12 +1074,21 @@ function codeCell(text: string | undefined, type: string | undefined, lang?: str
 // ---------- Live tool output (stdout / explore progress) ----------
 // Full text lives here; the card shows a non-scrollable tail. Click → sheet.
 const toolOutputs = new Map<string, string>();
+const toolOutputOrder: string[] = [];
+const MAX_RETAINED_TOOL_OUTPUTS = 100;
 const OUTPUT_PREVIEW_LINES = 8;
 const OUTPUT_KEEP_CHARS = 200_000;
 
 function appendToolOutput(id: string, delta: string) {
   const wrap = toolCards.get(id);
   if (!wrap) return;
+  if (!toolOutputs.has(id)) {
+    toolOutputOrder.push(id);
+    while (toolOutputOrder.length > MAX_RETAINED_TOOL_OUTPUTS) {
+      const expired = toolOutputOrder.shift();
+      if (expired) toolOutputs.delete(expired);
+    }
+  }
   let full = (toolOutputs.get(id) ?? "") + delta;
   if (full.length > OUTPUT_KEEP_CHARS) full = full.slice(-OUTPUT_KEEP_CHARS);
   toolOutputs.set(id, full);
@@ -1163,6 +1252,8 @@ function showAskUser(p: { id: string; question: string; options?: string[] }) {
 }
 // ---------- Overlay: sessions ----------
 function hideOverlay() {
+  clearControlCenterRefresh();
+  controlCenterRefreshPending = false;
   overlayEl.classList.add("hidden");
   overlayEl.innerHTML = "";
   settingsWanted = false;
@@ -1177,11 +1268,27 @@ function relativeTime(ms: number): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 function openSheet(): HTMLElement {
+  clearControlCenterRefresh();
+  controlCenterRefreshPending = false;
   overlayEl.innerHTML = "";
   const sheet = el("div", "sheet enter");
   overlayEl.appendChild(sheet);
   overlayEl.classList.remove("hidden");
   return sheet;
+}
+
+function clearControlCenterRefresh() {
+  if (controlCenterRefreshTimer !== undefined) {
+    window.clearTimeout(controlCenterRefreshTimer);
+    controlCenterRefreshTimer = undefined;
+  }
+}
+
+function requestControlCenter() {
+  if (controlCenterRefreshPending) return;
+  clearControlCenterRefresh();
+  controlCenterRefreshPending = true;
+  post({ type: "getControlCenter" });
 }
 function sheetHead(sheet: HTMLElement, title: string) {
   const head = el("div", "sheet-head");
@@ -1591,6 +1698,9 @@ function showSettings(s: SettingsPayload) {
         elm.value = Array.isArray(v) ? v.join("\n") : String(v);
       }
     });
+    existing.querySelectorAll<HTMLElement>("[data-profile]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.profile === s.costProfile);
+    });
     return;
   }
   // Unsolicited broadcast (config changed elsewhere) with no sheet open: ignore.
@@ -1600,6 +1710,24 @@ function showSettings(s: SettingsPayload) {
   sheet.classList.add("sheet-wide", "settings-sheet");
   sheetHead(sheet, "Settings");
   const body = el("div", "settings-body");
+
+  const profiles = setGroup("Cost profile");
+  const profileRow = el("div", "profile-grid");
+  for (const profile of ["economy", "balanced", "quality"] as const) {
+    const button = el("button", `profile-card${s.costProfile === profile ? " active" : ""}`);
+    button.dataset.profile = profile;
+    button.appendChild(el("span", "profile-name", profile[0].toUpperCase() + profile.slice(1)));
+    button.appendChild(el("span", "profile-copy",
+      profile === "economy" ? "16K agents · low reasoning · price routing" :
+      profile === "quality" ? "60K agents · high reasoning · full tools" :
+      "32K agents · adaptive reasoning · progressive tools"
+    ));
+    button.onclick = () => post({ type: "applyCostProfile", profile });
+    profileRow.appendChild(button);
+  }
+  profiles.appendChild(profileRow);
+  profiles.appendChild(el("div", "set-desc", "Profiles update concrete settings below; you can customize them afterward."));
+  body.appendChild(profiles);
 
   // --- Models ---
   const models = setGroup("Models");
@@ -1693,7 +1821,7 @@ function showSettings(s: SettingsPayload) {
   ctx.appendChild(
     setRow(
       "Sub-agent context budget",
-      "Token budget for explore/implement sub-agent contexts. When exceeded, the sub-agent answers from what it has.",
+      "Per-agent token ceiling. 32K is the cost-conscious default; raise it only for unusually broad research.",
       numberSetting("subagentMaxContextTokens", s.subagentMaxContextTokens, {
         min: 8000,
         step: 1000,
@@ -1724,7 +1852,7 @@ function showSettings(s: SettingsPayload) {
   ctx.appendChild(
     setRow(
       "Progressive tools",
-      "Start with read/meta schemas; unlock edit/exec after the first implement signal (lower prompt tax on research turns).",
+      "In Standard mode, start with read/meta schemas and unlock edit/exec after research. Auto always starts with every tool.",
       toggleSetting("progressiveTools", s.progressiveTools)
     )
   );
@@ -1777,8 +1905,33 @@ function showSettings(s: SettingsPayload) {
   beh.appendChild(
     setRow(
       "Worktree sandbox",
-      "Agent works in a separate git worktree; merge or discard via the command palette. (Dependencies aren't installed there.)",
+      "Agent works in an isolated git worktree; inspect, merge, or discard it from Control Center.",
       toggleSetting("worktreeMode", s.worktreeMode)
+    )
+  );
+  beh.appendChild(
+    setRow(
+      "Verification policy",
+      "Advisory reports missing evidence; Strict marks missing diagnostics or tests as a failed gate.",
+      selectSetting("verificationPolicy", s.verificationPolicy, [
+        ["advisory", "Advisory"],
+        ["standard", "Standard"],
+        ["strict", "Strict"],
+      ])
+    )
+  );
+  beh.appendChild(
+    setRow(
+      "Test-first bug fixes",
+      "When practical, reproduce bugs with a failing regression test before changing production code.",
+      toggleSetting("testFirstFixes", s.testFirstFixes)
+    )
+  );
+  beh.appendChild(
+    setRow(
+      "Crash-safe queue",
+      "Persist queued work and in-progress recovery markers across extension reloads.",
+      toggleSetting("durableQueue", s.durableQueue)
     )
   );
   const cmdTa = el("textarea", "set-input set-list set-json") as HTMLTextAreaElement;
@@ -1928,6 +2081,180 @@ function showSettings(s: SettingsPayload) {
   body.appendChild(conn);
 
   sheet.appendChild(body);
+}
+
+// ---------- Overlay: engineering Control Center ----------
+function showControlCenter(s: ControlCenterSnapshot) {
+  controlCenterRefreshPending = false;
+  clearControlCenterRefresh();
+
+  // Live snapshots arrive while an agent is running. Reuse the sheet instead
+  // of calling openSheet(), which clears the overlay and replays the entrance
+  // animation on every poll. Only the body changes, and its scroll is retained.
+  let sheet = overlayEl.querySelector(".control-center") as HTMLElement | null;
+  const previousBody = sheet?.querySelector(".control-body") as HTMLElement | null;
+  const previousScrollTop = previousBody?.scrollTop ?? 0;
+  if (!sheet) {
+    sheet = openSheet();
+    sheet.classList.add("sheet-wide", "control-center");
+    const head = sheetHead(sheet, "Control Center");
+    const refresh = el("button", "btn set-browse", "Refresh");
+    refresh.onclick = requestControlCenter;
+    head.insertBefore(refresh, head.lastChild);
+  }
+  const body = el("div", "usage-body control-body");
+
+  const overview = el("div", "stat-row");
+  overview.appendChild(statCard("Budget", s.budget.state));
+  overview.appendChild(statCard("Spent", fmtCost(s.budget.spent)));
+  overview.appendChild(statCard("Next turn", s.budget.projectedNextTurn === undefined ? "—" : `~${fmtCost(s.budget.projectedNextTurn)}`));
+  overview.appendChild(statCard("Queue", `${s.queue.length}${s.queuePaused ? " paused" : ""}`));
+  overview.appendChild(statCard("Source files", String(s.repo.sourceFiles)));
+  overview.appendChild(statCard("Tests", String(s.repo.testFiles)));
+  body.appendChild(overview);
+
+  const actions = el("div", "control-actions");
+  const patch = el("button", "btn", "Open Patch Studio") as HTMLButtonElement;
+  patch.disabled = checkpointFiles === 0;
+  patch.onclick = () => post({ type: "getTurnDiff" });
+  const pause = el("button", "btn", s.queuePaused ? "Resume queue" : "Pause queue");
+  pause.onclick = () => post({ type: "pauseQueue", paused: !s.queuePaused });
+  const memory = el("button", "btn", s.memory.path ? "Open project memory" : "Create project memory");
+  memory.onclick = () => post({ type: "createMemory" });
+  actions.append(patch, pause, memory);
+  body.appendChild(actions);
+
+  if (s.recovery) {
+    const sec = controlSection("Interrupted run", "recovery");
+    sec.appendChild(el("div", "control-main", s.recovery.text.slice(0, 500)));
+    sec.appendChild(el("div", "set-hint", `${s.recovery.model} · ${s.recovery.toolCalls} tool calls · last event ${s.recovery.lastEvent}`));
+    const bar = el("div", "control-actions");
+    const resume = el("button", "btn set-browse", "Inspect & resume");
+    resume.onclick = () => post({ type: "resumeRecovery" });
+    const discard = el("button", "btn danger", "Discard recovery marker");
+    discard.onclick = () => post({ type: "discardRecovery" });
+    bar.append(resume, discard);
+    sec.appendChild(bar);
+    body.appendChild(sec);
+  }
+
+  if (s.sandbox) {
+    const sec = controlSection("Isolated worktree", "sandbox");
+    sec.appendChild(el("div", "control-main", s.sandbox.branch));
+    sec.appendChild(el("div", "set-hint", `${s.sandbox.changedFiles} changed file(s) · ${s.sandbox.dir}`));
+    const bar = el("div", "control-actions");
+    const merge = el("button", "btn set-browse", "Merge patch into workspace");
+    merge.onclick = () => post({ type: "mergeSandbox" });
+    const discard = el("button", "btn danger", "Discard worktree");
+    discard.onclick = () => post({ type: "discardSandbox" });
+    bar.append(merge, discard);
+    sec.appendChild(bar);
+    body.appendChild(sec);
+  }
+
+  const gates = controlSection(`Verification gates · ${s.verificationPolicy}`, "gates");
+  if (!s.gates.length) gates.appendChild(el("div", "sheet-empty", "Complete a turn to see verification evidence."));
+  for (const gate of s.gates) {
+    const row = el("div", `control-row gate-${gate.status}`);
+    row.appendChild(el("span", "control-status", gate.status === "pass" ? "✓" : gate.status === "fail" ? "×" : gate.status === "warn" ? "!" : "–"));
+    const info = el("div", "control-info");
+    info.appendChild(el("div", "control-label", gate.label));
+    info.appendChild(el("div", "set-hint", gate.detail));
+    row.appendChild(info);
+    gates.appendChild(row);
+  }
+  body.appendChild(gates);
+
+  if (s.queue.length) {
+    const queue = controlSection("Background queue", "queue");
+    for (const job of s.queue) {
+      const row = el("div", "control-row");
+      const info = el("div", "control-info");
+      info.appendChild(el("div", "control-label", job.text.slice(0, 180)));
+      info.appendChild(el("div", "set-hint", new Date(job.createdAt).toLocaleString()));
+      const remove = el("button", "review-act danger", "Remove");
+      remove.onclick = () => post({ type: "removeQueued", id: job.id });
+      row.append(info, remove);
+      queue.appendChild(row);
+    }
+    body.appendChild(queue);
+  }
+
+  const graph = controlSection("Agent graph", "graph");
+  if (!s.graph.length) graph.appendChild(el("div", "sheet-empty", "No completed agent activity yet."));
+  for (const node of s.graph.slice(-40)) {
+    const row = el("div", `graph-node ${node.parent ? "child" : ""} ${node.status}`);
+    row.appendChild(el("span", "graph-dot"));
+    row.appendChild(el("span", "control-label", node.label));
+    const meta = [node.cost === undefined ? "" : fmtCost(node.cost), node.durationMs === undefined ? "" : `${Math.round(node.durationMs / 1000)}s`].filter(Boolean).join(" · ");
+    if (meta) row.appendChild(el("span", "graph-meta", meta));
+    if (node.prompt && node.status !== "running") {
+      const retry = el("button", "review-act", "Retry");
+      retry.onclick = () => {
+        hideOverlay();
+        post({ type: "retryGraphNode", prompt: node.prompt! });
+      };
+      row.appendChild(retry);
+    }
+    graph.appendChild(row);
+  }
+  body.appendChild(graph);
+
+  const repo = controlSection("Repository intelligence", "repo");
+  repo.appendChild(el("div", "control-main", s.repo.languages.join(" · ") || "No source language detected"));
+  if (s.repo.entrypoints.length) repo.appendChild(el("div", "set-hint", `Entrypoints: ${s.repo.entrypoints.join(", ")}`));
+  if (s.repo.modules.length) repo.appendChild(el("div", "control-bars", s.repo.modules.slice(0, 8).map((m) => `${m.name} ${m.files}`).join("  ·  ")));
+  if (s.repo.dependencies.length) repo.appendChild(el("div", "set-hint", `Dependencies: ${s.repo.dependencies.slice(0, 8).map((d) => `${d.from} → ${d.to} (${d.count})`).join(" · ")}`));
+  for (const risk of s.repo.risk) repo.appendChild(el("div", "control-risk", `⚠ ${risk}`));
+  for (const hot of s.repo.hotspots.slice(0, 6)) repo.appendChild(el("div", "control-row compact", `${hot.path} · ${hot.touches} turns · ${hot.churn} changed lines`));
+  body.appendChild(repo);
+
+  const lab = controlSection("Tool Development Lab", "tools");
+  for (const phase of s.tools) {
+    const row = el("div", "control-row");
+    const info = el("div", "control-info");
+    info.appendChild(el("div", "control-label", `${phase.phase} · ${phase.tools} tools · ~${phase.estimatedTokens.toLocaleString()} schema tokens`));
+    info.appendChild(el("div", "set-hint", `Largest: ${phase.largest.map((x) => `${x.name} ${x.estimatedTokens}`).join(", ")}`));
+    row.appendChild(info);
+    lab.appendChild(row);
+  }
+  body.appendChild(lab);
+
+  const mem = controlSection("Inspectable project memory", "memory");
+  mem.appendChild(el("div", "control-main", s.memory.path ?? "No LUNA.md or compatible project memory found."));
+  if (s.memory.decisions.length) mem.appendChild(el("div", "set-hint", `Session decisions: ${s.memory.decisions.join(" · ")}`));
+  if (s.memory.contents) mem.appendChild(el("pre", "memory-preview", s.memory.contents.slice(0, 2500)));
+  body.appendChild(mem);
+
+  const audit = controlSection("Security & trust audit", "audit");
+  if (!s.audit.length) audit.appendChild(el("div", "sheet-empty", "No audited actions in this session."));
+  for (const item of s.audit.slice(0, 40)) {
+    const row = el("div", `control-row audit-${item.outcome}`);
+    const info = el("div", "control-info");
+    info.appendChild(el("div", "control-label", `${item.action} · ${item.outcome}`));
+    info.appendChild(el("div", "set-hint", `${item.subject} · ${new Date(item.at).toLocaleTimeString()}`));
+    row.appendChild(info);
+    audit.appendChild(row);
+  }
+  body.appendChild(audit);
+  if (previousBody) previousBody.replaceWith(body);
+  else sheet.appendChild(body);
+  body.scrollTop = previousScrollTop;
+
+  if (state.running) {
+    controlCenterRefreshTimer = window.setTimeout(() => {
+      controlCenterRefreshTimer = undefined;
+      if (sheet.isConnected && !overlayEl.classList.contains("hidden")) {
+        requestControlCenter();
+      }
+    }, 1500);
+  }
+}
+
+function controlSection(title: string, cls: string): HTMLElement {
+  const section = el("section", `control-section control-${cls}`);
+  section.appendChild(el("div", "block-label", title));
+  return section;
 }
 
 // ---------- Task checklist ----------
@@ -2520,6 +2847,7 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       setRunning(true);
       currentAssistant = null;
       currentTurnModel = msg.model || state.model;
+      currentActivityPhase = "";
       clearQueuedTags();
       thinkCountEl.textContent = "";
       // A finished plan is stale clutter on the next turn — clear it. An
@@ -2556,7 +2884,7 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       break;
     }
     case "toolEnd":
-      addToolEnd(msg.id, msg.name, msg.ok, msg.summary, msg.diff);
+      addToolEnd(msg.id, msg.name, msg.ok, msg.summary, msg.diff, msg.report);
       // Back to thinking until the next text/tool/turn-end — only during a live turn.
       if (state.running) {
         startThink();
@@ -2600,6 +2928,9 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       break;
     case "contextInfo":
       showContextInfo(msg.info);
+      break;
+    case "controlCenter":
+      showControlCenter(msg.snapshot);
       break;
     case "mentionMatches":
       if (msg.token === mentionToken) renderMention(msg.items.map(mentionRowFromItem));
@@ -2659,6 +2990,14 @@ window.addEventListener("message", (event: MessageEvent<HostToWebview>) => {
       updateMeter();
       break;
     }
+    case "turnReceipt":
+      appendTurnReceipt(msg.receipt, messagesEl, {
+        fmtTokens,
+        fmtCost,
+        onLayout: () => scrollToBottom(),
+      });
+      currentActivityPhase = "";
+      break;
     case "approvalRequest":
       showApproval(msg.payload);
       break;

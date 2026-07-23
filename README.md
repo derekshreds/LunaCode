@@ -41,6 +41,8 @@ It's built for fast codebase navigation, efficient agentic sessions, and
   (`lunacode.subagentModel`, cheap model recommended — blank uses the selected
   model). Pass `questions` to fan out independent topics in parallel. Only the
   digests return to the main conversation, keeping it small and cache-friendly.
+  Each run also gets an expandable UI-only report with source files, tool mix,
+  iterations, duration, tokens, cache rate, and cost—without bloating model context.
 - **Loop guard.** Soft-blocks runaway rewrite loops (same file/command mutated
   too many times in one turn) so the model can adapt; hard-stops only after
   consecutive fully-blocked rounds. Paged `read_file` ranges are never treated
@@ -78,8 +80,51 @@ It's built for fast codebase navigation, efficient agentic sessions, and
 - **Context inspector.** Click the session cost in the meter to see exactly
   what's in the context window: totals vs budget, system-prompt size, the
   largest items, and the estimated cost of the next (cached) call.
-- **Multi-file patches.** An `apply_patch` tool edits many files in one model
-  round-trip instead of one call per file.
+- **Atomic batched patches.** `apply_patch` preflights every requested change
+  before writing, supports exact replacements and line ranges, and edits one or
+  many files in a single model round-trip.
+- **Revision-safe edits.** `read_file` returns a compact content revision;
+  `edit_file`, `write_file`, and `apply_patch` can reject stale changes when a
+  user, formatter, or another agent modified the file after it was read.
+- **Conflict-safe implementers.** Scoped `implement.jobs` enforce declared
+  write paths and run concurrently only when every scope is disjoint. Unscoped
+  or overlapping work is serialized automatically. Every implementer runs in
+  a disposable Git worktree based on the caller's current tracked state; Luna
+  snapshots every affected file and merges only the completed binary patch.
+- **Engineering Control Center.** The sliders button (or **Luna Code: Open
+  Control Center**) combines budget projections, durable queue controls,
+  interrupted-run recovery, verification gates, the live agent graph,
+  repository hotspots, tool-schema measurements, project memory, worktree
+  actions, and the security audit in one responsive surface.
+- **Patch Studio and intent-level undo.** Review the complete turn change set,
+  open native editable diffs, revert individual files or selected hunks, or
+  rewind the entire logical turn—including patches produced by implementers.
+- **Verification policies.** Advisory, Standard, and Strict gates evaluate
+  diagnostics, tests/builds, and tool failures from actual turn receipts.
+  Test-first bug-fix guidance plus `/regression` captures red→green evidence.
+- **Crash-safe background work.** Queued prompts, active-run markers, and audit
+  state persist with the session. Interrupted work resumes with an explicit
+  inspect-first continuation instead of blindly replaying side effects.
+- **Model tournaments.** The `tournament` tool runs two independent candidate
+  analyses on distinct configured routes when possible, then asks the parent
+  model to judge and synthesize them. Use `/tournament <decision>` directly.
+- **Repository intelligence.** Control Center maps languages, entrypoints,
+  module sizes, test density, high-change files, and architectural risk from
+  the current repository and durable receipts.
+- **Security and trust audit.** Approvals, commands, writes, sandbox operations,
+  recovery, denials, and failures are durable session evidence. Common
+  credential formats are redacted from command output; sensitive file reads
+  require parent approval and are blocked inside delegated agents.
+- **Persistent turn receipts.** Every completed turn records changed files,
+  commands, validation evidence, delegation, failures, tokens, cache rate,
+  schema tax, cost, and duration. Receipts survive session reloads.
+- **Cost profiles and forecasts.** Economy, Balanced, and Quality presets tune
+  reasoning, provider routing, context carry cost, tool loading, and sub-agent
+  budgets. Delegation cards show a cost ceiling before work starts.
+- **Benchmark harness.** `npm run benchmark` reports fixed tool-schema tax.
+  Export real receipt data with **Luna Code: Export Benchmark Metrics**, then run
+  `npm run benchmark -- path/to/metrics.json` for cost, latency, cache, tool,
+  failure, and throughput measurements.
 - **Background processes.** `start_process` / `read_process` / `stop_process`
   let the agent run a dev server, probe it, read the logs, and iterate.
 - **Session budget guardrail.** `lunacode.sessionBudgetUsd` pauses the agent
@@ -89,7 +134,8 @@ It's built for fast codebase navigation, efficient agentic sessions, and
   File*, *Refactor Selection…*, and *Explain Selection*; and every diagnostic's
   lightbulb offers **Fix with Luna Code**. Multi-root workspaces pick their
   working folder via *Select Working Folder*.
-- **Slash commands.** `/commit`, `/review`, `/tests` built in, plus your own
+- **Slash commands.** `/commit`, `/review`, `/tests`, `/regression`, and
+  `/tournament` built in, plus your own
   templates via `lunacode.customCommands` — with autocomplete in the composer.
 - **Image paste.** Paste screenshots into the composer (up to 3, multimodal
   models via OpenRouter).
@@ -162,7 +208,7 @@ All settings live under the `lunacode.*` namespace (Settings → Extensions → 
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `lunacode.model` | `deepseek/deepseek-v4-flash` | OpenRouter model id (use the picker / Browse all for current ids). |
+| `lunacode.model` | `z-ai/glm-5.2` | OpenRouter model id (use the picker / Browse all for current ids). |
 | `lunacode.baseUrl` | `https://openrouter.ai/api/v1` | API base URL (override for proxies). |
 | `lunacode.defaultMode` | `standard` | `standard` \| `auto` \| `plan`. |
 | `lunacode.maxTokens` | `0` | Max tokens per turn. `0` = use the model's full output limit (avoids truncating large `write_file` calls). |
@@ -173,6 +219,10 @@ All settings live under the `lunacode.*` namespace (Settings → Extensions → 
 | `lunacode.maxContextTokens` | `180000` | Budget before older context is compacted. |
 | `lunacode.autoApproveCommands` | common read-only cmds | Auto-approved even in Standard mode. |
 | `lunacode.alwaysDenyCommands` | destructive cmds | Always blocked, any mode. |
+| `lunacode.verificationPolicy` | `standard` | `advisory` \| `standard` \| `strict` receipt gates. |
+| `lunacode.testFirstFixes` | `true` | Prefer a failing regression test before production bug fixes. |
+| `lunacode.durableQueue` | `true` | Persist queued work and interrupted-run recovery markers. |
+| `lunacode.worktreeMode` | `false` | Isolate the main agent; implementer subagents use independent worktrees automatically. |
 
 ## Tools the agent can use
 
@@ -183,6 +233,9 @@ All settings live under the `lunacode.*` namespace (Settings → Extensions → 
 | `glob` | no | Find files by glob pattern. |
 | `grep` | no | Regex search across the workspace. |
 | `get_diagnostics` | no | Read language-server errors/warnings. |
+| `explore` | no | Delegate bounded repository research. |
+| `tournament` | no | Produce two independent candidates for parent-model judgment. |
+| `implement` | yes | Run a scoped implementer in an isolated worktree and merge its patch. |
 | `write_file` | yes | Create/overwrite a file. |
 | `edit_file` | yes | Exact-string targeted edit. |
 | `run_command` | yes | Run a shell command (PowerShell on Windows, sh elsewhere). |

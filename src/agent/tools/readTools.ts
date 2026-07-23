@@ -12,6 +12,8 @@ import {
   resolveInWorkspace,
   toRelative,
   truncate,
+  fileRevision,
+  isSensitivePath,
 } from "./util";
 import { formatRgMatches, rgSearch } from "./rg";
 
@@ -53,6 +55,20 @@ export const readFileTool: Tool = {
     required: ["path"],
   },
   async execute(args, ctx): Promise<ToolResult> {
+    if (isSensitivePath(String(args.path))) {
+      if (ctx.delegated) {
+        return { content: `Sensitive file reads are blocked inside delegated agents: ${args.path}`, isError: true };
+      }
+      // Nested research/implementation agents have no interactive approval
+      // bridge; the guard above keeps these reads parent-only.
+      const decision = await ctx.requestApproval({
+        kind: "secret-read",
+        title: "Read potentially sensitive file",
+        subject: String(args.path),
+        detail: "This file may contain credentials. Its contents would enter model context.",
+      });
+      if (decision === "rejected") return { content: `Sensitive file read rejected: ${args.path}`, isError: true };
+    }
     const dup = dedupHit(ctx, "read_file", {
       path: args.path,
       offset: args.offset,
@@ -81,6 +97,7 @@ export const readFileTool: Tool = {
       };
     }
     const allLines = buf.toString("utf8").split("\n");
+    const revision = fileRevision(buf);
     const totalLines = allLines.length;
     const explicitPaging = args.offset != null || args.limit != null;
     const offset = Math.max(1, args.offset ?? 1);
@@ -124,8 +141,8 @@ export const readFileTool: Tool = {
       footer = `\n\n…[truncated — re-read with offset/limit]`;
     }
     const result: ToolResult = {
-      content: header + text + footer,
-      ui: { path: args.path, lines: totalLines, truncated: truncated || autoPaged },
+      content: `revision ${revision}\n` + header + text + footer,
+      ui: { path: args.path, lines: totalLines, revision, truncated: truncated || autoPaged },
     };
     readCacheSet(cacheKey, result.content, result.isError);
     return result;
